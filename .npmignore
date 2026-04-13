@@ -10,3 +10,4 @@ webpack.config.js
 jest.config.*
 *.tgz
 .DS_Store
+.claude/
