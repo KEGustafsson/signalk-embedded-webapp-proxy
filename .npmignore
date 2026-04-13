@@ -1,0 +1,12 @@
+src/
+test/
+coverage/
+.gitignore
+.eslintrc*
+eslint.config.*
+.prettierrc*
+tsconfig*.json
+webpack.config.js
+jest.config.*
+*.tgz
+.DS_Store

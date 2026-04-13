@@ -1,0 +1,223 @@
+# signalk-embedded-webapp-proxy
+
+SignalK embedded webapp plugin that acts as a general reverse proxy, letting you embed any web application into the SignalK admin UI.
+
+Configure one or more applications (Portainer CE, Grafana, Node-RED, etc.). A selector UI lets you switch between them directly from the SignalK webapp panel.
+
+## Prerequisites
+
+- [SignalK server](https://github.com/SignalK/signalk-server) (v2.x or later)
+- Node.js >= 18
+- The web applications you want to embed, accessible from the SignalK host
+
+## Installation
+
+### Via SignalK Appstore (recommended)
+
+1. Open the SignalK admin UI
+2. Navigate to **Appstore** > **Available**
+3. Search for **Embedded Webapp Proxy**
+4. Click **Install**
+5. Restart SignalK server
+
+### Via npm
+
+```bash
+cd ~/.signalk
+npm install signalk-embedded-webapp-proxy
+```
+
+Then restart the SignalK server.
+
+## Plugin Configuration
+
+After installation, configure the plugin in the SignalK admin UI:
+
+1. Navigate to **Server** > **Plugin Config**
+2. Find **Embedded Webapp Proxy** in the plugin list
+3. Enable the plugin
+4. Add one or more applications under **Web Applications**:
+
+| Field                              | Description                                                                          | Default              |
+| ---------------------------------- | ------------------------------------------------------------------------------------ | -------------------- |
+| **Name**                           | Display name shown in the app selector                                               | `My App`             |
+| **Proxy Path**                     | Custom path identifier (e.g. `portainer`). When set, the app is also accessible at `/plugins/signalk-embedded-webapp-proxy/proxy/<appPath>`. Must start with a letter; only letters, digits, and hyphens allowed. | _(none)_ |
+| **Application URL**                | URL with protocol and host required; port is optional (defaults to `80` for http, `443` for https); base path is optional — e.g. `http://192.168.1.100:9000`, `https://myapp.local/admin` | `http://127.0.0.1` |
+| **Allow Self-Signed Certificates** | Accept self-signed TLS certs (HTTPS only)                                            | `false`              |
+| **Rewrite Absolute Paths**         | Inject a script into HTML responses that rewrites absolute API paths (e.g. `/api/auth`) so they route through the proxy. Enable for SPAs like Portainer or Grafana — eliminates the need for `--base-url` on the target container. | `false` |
+| **Timeout (ms)**                   | `apps[].timeout` — milliseconds to wait for the target before returning a 502. `0` disables the timeout. E.g. `5000` for 5 s. | `0` |
+
+5. Click **Submit** to save
+
+### Example: Portainer CE + Grafana
+
+```json
+{
+  "apps": [
+    {
+      "name": "Portainer CE",
+      "appPath": "portainer",
+      "url": "https://127.0.0.1:9443",
+      "allowSelfSigned": true,
+      "rewritePaths": true
+    },
+    {
+      "name": "Grafana",
+      "url": "http://127.0.0.1:3000",
+      "rewritePaths": true
+    }
+  ]
+}
+```
+
+## Usage
+
+Once the plugin is enabled and configured:
+
+1. Open the SignalK admin UI
+2. Navigate to **Webapps**
+3. Click **Embedded Webapp Proxy**
+4. If multiple apps are configured, select one from the dropdown
+5. The selected application loads embedded in the SignalK admin UI
+
+If only one application is configured, it loads automatically without requiring a selection.
+
+## Proxy URL structure
+
+Each application is accessible by its numeric index:
+
+```text
+/plugins/signalk-embedded-webapp-proxy/proxy/{index}/
+```
+
+If an `appPath` is configured, the app is also accessible at:
+
+```text
+/plugins/signalk-embedded-webapp-proxy/proxy/{appPath}/
+```
+
+| App | Proxy URLs |
+|-----|-----------|
+| First app (index 0, appPath `portainer`)  | `/plugins/signalk-embedded-webapp-proxy/proxy/0/` or `/plugins/signalk-embedded-webapp-proxy/proxy/portainer/` |
+| Second app (index 1, no appPath) | `/plugins/signalk-embedded-webapp-proxy/proxy/1/` |
+
+The list of configured apps (name, index, appPath) is also available as JSON:
+
+```http
+GET /plugins/signalk-embedded-webapp-proxy/apps
+```
+
+## Application-specific setup notes
+
+### Portainer CE
+
+Portainer's frontend makes API calls using absolute paths (e.g. `POST /api/auth`). Without path rewriting these requests bypass the proxy and hit the SignalK server, causing login to fail silently.
+
+**Fix:** Enable **Rewrite Absolute Paths** (`rewritePaths: true`) in the plugin config. The proxy automatically injects a script into HTML responses that rewrites absolute API paths through the proxy. No `--base-url` flag is needed on the Portainer container.
+
+```bash
+# HTTPS (default for Portainer CE v2.9+)
+docker run -d \
+  -p 9443:9443 \
+  --name portainer \
+  --restart=always \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v portainer_data:/data \
+  portainer/portainer-ce:lts
+
+# HTTP (legacy / manually enabled)
+docker run -d \
+  -p 9000:9000 \
+  --name portainer \
+  --restart=always \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v portainer_data:/data \
+  portainer/portainer-ce:lts \
+  --http-enabled
+```
+
+> The same applies to other SPAs like Grafana that use absolute API paths. Enable `rewritePaths` for any application where login or POST requests fail silently.
+
+## Security considerations
+
+- **Only proxy trusted internal applications.** The plugin performs no authentication of its own; any app reachable at the configured host:port will be forwarded to anyone with access to the SignalK UI.
+- **iframe same-origin access.** The embedded iframe uses `allow-same-origin` in its sandbox so that cookie and session-based authentication works in proxied apps (e.g. Portainer). This means proxied content runs at the SignalK admin origin and can access admin-origin cookies. Only configure apps you fully trust.
+- **Port is optional.** If omitted from the URL, the port defaults to `80` for `http` and `443` for `https`. An invalid host causes the app entry to be skipped and logged via `app.error`.
+- **Cloud metadata endpoints are blocked.** Hosts `169.254.169.254` and `metadata.google.internal` (and case/dot variants) are rejected to prevent SSRF against cloud instance metadata APIs.
+
+## Troubleshooting
+
+### Application not loading (503 error)
+
+- Ensure the target application is running and reachable from the SignalK host
+- Verify the application URL in the plugin settings
+- Check that the plugin is enabled in SignalK Plugin Config
+
+### Connection refused
+
+- Confirm the application port is bound on the host (e.g. `-p 9443:9443` for Docker)
+- Check firewall rules if the application runs on a different host
+- Test connectivity directly: `curl http://127.0.0.1:<port>`
+
+### Login or POST requests hang
+
+The application's frontend is making API calls with absolute paths that bypass the proxy. Enable **Rewrite Absolute Paths** (`rewritePaths: true`) in the plugin config for that app. This injects a script that rewrites `/api/...` calls to go through the proxy. See the **Portainer CE** section above.
+
+### Container console/terminal not working (WebSocket)
+
+- WebSocket upgrade connections are proxied automatically per app
+- Ensure no upstream reverse proxy is stripping `Upgrade` / `Connection` headers
+
+### Blank page or assets not loading
+
+- Clear browser cache and reload
+- Check the browser developer console for errors
+- Ensure the application is fully started before accessing it
+
+## Development
+
+### Setup
+
+```bash
+git clone https://github.com/KEGustafsson/signalk-portainer.git
+cd signalk-portainer
+npm install
+```
+
+### Build
+
+```bash
+npm run build          # Build both plugin and UI
+npm run build:plugin   # Build plugin only (TypeScript)
+npm run build:ui       # Build UI only (webpack)
+```
+
+### Test
+
+```bash
+npm test               # Run all tests with coverage
+npm run test:watch     # Run tests in watch mode
+```
+
+### Lint & Format
+
+```bash
+npm run lint           # Check for lint errors
+npm run lint:fix       # Auto-fix lint errors
+npm run format         # Format code with Prettier
+npm run format:check   # Check formatting
+```
+
+### Link for local development
+
+```bash
+npm run build
+cd ~/.signalk
+npm link /path/to/signalk-portainer
+```
+
+Then restart SignalK server. Changes to the plugin source require rebuilding and restarting.
+
+## License
+
+[MIT](LICENSE)
