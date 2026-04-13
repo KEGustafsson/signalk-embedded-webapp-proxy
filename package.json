@@ -1,6 +1,6 @@
 {
   "name": "signalk-embedded-webapp-proxy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Signal K embedded webapp plugin — Run any local web application as an embedded Webapp",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -29,14 +29,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KEGustafsson/signalk-portainer.git"
+    "url": "git+https://github.com/KEGustafsson/signalk-embedded-webapp-proxy.git"
   },
   "author": "Karl-Erik Gustafsson",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/KEGustafsson/signalk-portainer/issues"
+    "url": "https://github.com/KEGustafsson/signalk-embedded-webapp-proxy/issues"
   },
-  "homepage": "https://github.com/KEGustafsson/signalk-portainer#readme",
+  "homepage": "https://github.com/KEGustafsson/signalk-embedded-webapp-proxy#readme",
   "engines": {
     "node": ">=18.0.0"
   },
@@ -50,14 +50,14 @@
     "@testing-library/react": "^16.3.0",
     "@types/express": "^5.0.2",
     "@types/jest": "^29.5.14",
-    "@types/react": "^19.1.2",
+    "@types/react": "^19.0.0",
     "eslint": "^9.25.0",
     "eslint-config-prettier": "^10.1.2",
     "eslint-plugin-react": "^7.37.5",
     "jest": "^29.7.0",
     "jest-environment-jsdom": "^29.7.0",
     "prettier": "^3.5.3",
-    "react": "^19.1.0",
+    "react": "^19.0.0",
     "ts-jest": "^29.3.2",
     "ts-loader": "^9.5.2",
     "typescript": "^5.8.3",
