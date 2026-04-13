@@ -322,12 +322,6 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
           ...(appConfig.rewritePaths ? { selfHandleResponse: true } : {}),
           on: {
             proxyReq(proxyReq, req): void {
-              // Re-stream the request body when an upstream body-parser
-              // (e.g. SignalK's global bodyParser.json()) has already
-              // consumed the raw body.  Without this, POST/PUT/PATCH
-              // requests (like Portainer's /api/auth login) arrive at
-              // the target with an empty body.
-              fixRequestBody(proxyReq, req)
               const remoteAddress = req.socket?.remoteAddress ?? ''
               proxyReq.setHeader('X-Real-IP', remoteAddress)
               const existing = req.headers['x-forwarded-for']
@@ -344,6 +338,12 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                 // Only advertise encodings we can decompress for HTML script injection.
                 proxyReq.setHeader('Accept-Encoding', 'gzip, deflate, br, identity')
               }
+              // Re-stream the request body when an upstream body-parser
+              // (e.g. SignalK's global bodyParser.json()) has already
+              // consumed the raw body.  Must be called after all setHeader()
+              // calls — fixRequestBody writes to the proxy request which
+              // locks headers; calling setHeader afterwards throws ERR_HTTP_HEADERS_SENT.
+              fixRequestBody(proxyReq, req)
             },
             ...(appConfig.rewritePaths
               ? {
