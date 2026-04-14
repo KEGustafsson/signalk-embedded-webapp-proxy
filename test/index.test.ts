@@ -1418,7 +1418,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
         Location: { prototype: {} },
         Object,
       }
-      ;(sandbox.window as Record<string, unknown>).WebSocket = FakeWS
+      sandbox.window.WebSocket = FakeWS
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const vm = require('vm') as typeof import('vm')
       vm.createContext(sandbox)

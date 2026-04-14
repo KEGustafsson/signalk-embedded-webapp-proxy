@@ -399,174 +399,180 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
         const proxyPathPrefix = `${PLUGIN_PATH_PREFIX}${PROXY_SUBPATH}/${appConfig.appPath || String(appIndex)}`
         const makeProxy = (target: string, enableRewrite: boolean): RequestHandler =>
           createProxyMiddleware({
-          target,
-          changeOrigin: true,
-          ws: false,
-          secure: !(appConfig.scheme === 'https' && appConfig.allowSelfSigned),
-          ...(appConfig.timeout > 0 ? { proxyTimeout: appConfig.timeout } : {}),
-          // Always self-handle responses so upstream headers (especially
-          // Content-Type) are forwarded faithfully and not overwritten by
-          // middleware in the pipeline.
-          selfHandleResponse: true,
-          on: {
-            proxyReq(proxyReq, req): void {
-              const remoteAddress = req.socket?.remoteAddress ?? ''
-              proxyReq.setHeader('X-Real-IP', remoteAddress)
-              const existing = req.headers['x-forwarded-for']
-              const forwarded = existing ? `${String(existing)}, ${remoteAddress}` : remoteAddress
-              proxyReq.setHeader('X-Forwarded-For', forwarded)
-              const incomingProto = req.headers['x-forwarded-proto']
-              const rawProto =
-                typeof incomingProto === 'string' ? incomingProto : (incomingProto?.[0] ?? '')
-              const proto =
-                rawProto.split(',')[0]?.trim() ||
-                ((req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http')
-              proxyReq.setHeader('X-Forwarded-Proto', proto)
-              if (enableRewrite) {
-                // Constrain Accept-Encoding to encodings we can decompress for HTML
-                // script injection (br, gzip, deflate). Must honor what the *client*
-                // accepts — if we upgrade the client's Accept-Encoding and upstream
-                // compresses, the client will receive bytes it can't decode (e.g. a
-                // sandboxed iframe module import that sent Accept-Encoding: identity
-                // would see raw brotli and fail with an illegal-character error).
-                const clientAE = String(req.headers['accept-encoding'] ?? '')
-                  .toLowerCase()
-                  .split(',')
-                  .map((s) => s.split(';')[0]!.trim())
-                  .filter(Boolean)
-                const supported = clientAE.filter((e) =>
-                  ['gzip', 'deflate', 'br', 'identity'].includes(e),
-                )
-                proxyReq.setHeader(
-                  'Accept-Encoding',
-                  supported.length > 0 ? supported.join(', ') : 'identity',
-                )
-              }
-              // Re-stream the request body when an upstream body-parser
-              // (e.g. SignalK's global bodyParser.json()) has already
-              // consumed the raw body.  Must be called after all setHeader()
-              // calls — fixRequestBody writes to the proxy request which
-              // locks headers; calling setHeader afterwards throws ERR_HTTP_HEADERS_SENT.
-              fixRequestBody(proxyReq, req)
-            },
-            proxyRes(proxyRes: IncomingMessage, _req: IncomingMessage, res: ServerResponse): void {
-              const ct = String(proxyRes.headers['content-type'] ?? '')
-              const status = proxyRes.statusCode ?? 200
+            target,
+            changeOrigin: true,
+            ws: false,
+            secure: !(appConfig.scheme === 'https' && appConfig.allowSelfSigned),
+            ...(appConfig.timeout > 0 ? { proxyTimeout: appConfig.timeout } : {}),
+            // Always self-handle responses so upstream headers (especially
+            // Content-Type) are forwarded faithfully and not overwritten by
+            // middleware in the pipeline.
+            selfHandleResponse: true,
+            on: {
+              proxyReq(proxyReq, req): void {
+                const remoteAddress = req.socket?.remoteAddress ?? ''
+                proxyReq.setHeader('X-Real-IP', remoteAddress)
+                const existing = req.headers['x-forwarded-for']
+                const forwarded = existing ? `${String(existing)}, ${remoteAddress}` : remoteAddress
+                proxyReq.setHeader('X-Forwarded-For', forwarded)
+                const incomingProto = req.headers['x-forwarded-proto']
+                const rawProto =
+                  typeof incomingProto === 'string' ? incomingProto : (incomingProto?.[0] ?? '')
+                const proto =
+                  rawProto.split(',')[0]?.trim() ||
+                  ((req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http')
+                proxyReq.setHeader('X-Forwarded-Proto', proto)
+                if (enableRewrite) {
+                  // Constrain Accept-Encoding to encodings we can decompress for HTML
+                  // script injection (br, gzip, deflate). Must honor what the *client*
+                  // accepts — if we upgrade the client's Accept-Encoding and upstream
+                  // compresses, the client will receive bytes it can't decode (e.g. a
+                  // sandboxed iframe module import that sent Accept-Encoding: identity
+                  // would see raw brotli and fail with an illegal-character error).
+                  const clientAE = String(req.headers['accept-encoding'] ?? '')
+                    .toLowerCase()
+                    .split(',')
+                    .map((s) => s.split(';')[0]!.trim())
+                    .filter(Boolean)
+                  const supported = clientAE.filter((e) =>
+                    ['gzip', 'deflate', 'br', 'identity'].includes(e),
+                  )
+                  proxyReq.setHeader(
+                    'Accept-Encoding',
+                    supported.length > 0 ? supported.join(', ') : 'identity',
+                  )
+                }
+                // Re-stream the request body when an upstream body-parser
+                // (e.g. SignalK's global bodyParser.json()) has already
+                // consumed the raw body.  Must be called after all setHeader()
+                // calls — fixRequestBody writes to the proxy request which
+                // locks headers; calling setHeader afterwards throws ERR_HTTP_HEADERS_SENT.
+                fixRequestBody(proxyReq, req)
+              },
+              proxyRes(
+                proxyRes: IncomingMessage,
+                _req: IncomingMessage,
+                res: ServerResponse,
+              ): void {
+                const ct = String(proxyRes.headers['content-type'] ?? '')
+                const status = proxyRes.statusCode ?? 200
 
-              if (enableRewrite) {
-                // Rewrite Location headers on redirects so the browser
-                // follows through the proxy instead of hitting the host root.
-                // e.g. "Location: /grafana/login" → "Location: /plugins/signalk-embedded-webapp-proxy/proxy/grafana/login"
-                if (proxyRes.headers['location']) {
-                  const loc = String(proxyRes.headers['location'])
-                  // Only rewrite root-relative paths (not absolute URLs or protocol-relative)
-                  if (
-                    loc.charAt(0) === '/' &&
-                    loc.charAt(1) !== '/' &&
-                    !loc.startsWith(proxyPathPrefix)
-                  ) {
-                    const appPathBase =
-                      appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
-                    let suffix: string
-                    if (!appPathBase) {
-                      suffix = loc
-                    } else if (loc.startsWith(appPathBase + '/')) {
-                      suffix = loc.slice(appPathBase.length)
-                    } else if (loc === appPathBase) {
-                      suffix = '/'
-                    } else {
-                      suffix = `${ROOT_ESCAPE}${loc}`
+                if (enableRewrite) {
+                  // Rewrite Location headers on redirects so the browser
+                  // follows through the proxy instead of hitting the host root.
+                  // e.g. "Location: /grafana/login" → "Location: /plugins/signalk-embedded-webapp-proxy/proxy/grafana/login"
+                  if (proxyRes.headers['location']) {
+                    const loc = String(proxyRes.headers['location'])
+                    // Only rewrite root-relative paths (not absolute URLs or protocol-relative)
+                    if (
+                      loc.charAt(0) === '/' &&
+                      loc.charAt(1) !== '/' &&
+                      !loc.startsWith(proxyPathPrefix)
+                    ) {
+                      const appPathBase =
+                        appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
+                      let suffix: string
+                      if (!appPathBase) {
+                        suffix = loc
+                      } else if (loc.startsWith(appPathBase + '/')) {
+                        suffix = loc.slice(appPathBase.length)
+                      } else if (loc === appPathBase) {
+                        suffix = '/'
+                      } else {
+                        suffix = `${ROOT_ESCAPE}${loc}`
+                      }
+                      proxyRes.headers['location'] = `${proxyPathPrefix}${suffix}`
                     }
-                    proxyRes.headers['location'] = `${proxyPathPrefix}${suffix}`
+                  }
+
+                  if (ct.includes('text/html')) {
+                    // HTML: decompress if needed, inject path-rewriting script, then send.
+                    const encoding = String(
+                      proxyRes.headers['content-encoding'] ?? '',
+                    ).toLowerCase()
+                    const stream: NodeJS.ReadableStream =
+                      encoding === 'gzip' || encoding === 'x-gzip'
+                        ? proxyRes.pipe(createGunzip())
+                        : encoding === 'deflate'
+                          ? proxyRes.pipe(createInflate())
+                          : encoding === 'br'
+                            ? proxyRes.pipe(createBrotliDecompress())
+                            : proxyRes
+                    const chunks: Buffer[] = []
+                    stream.on('data', (chunk: Buffer) => {
+                      chunks.push(chunk)
+                    })
+                    stream.on('end', () => {
+                      const html = Buffer.concat(chunks).toString('utf-8')
+                      const script = buildRewriteScript(proxyPathPrefix, appConfig.path)
+                      const injected = html.replace(/<head[^>]*>/i, (m) => m + script)
+                      // Rewrite absolute-path src/href/action attributes so static assets
+                      // and form actions route through the proxy instead of hitting the
+                      // host root.  Protocol-relative URLs (//…) are left untouched.
+                      // When the app has a configured base path (e.g. /grafana), strip it
+                      // from matching URLs before prepending the proxy prefix to prevent
+                      // double-prefixing (e.g. /grafana/d/... → /proxy/grafana/d/..., not
+                      // /proxy/grafana/grafana/d/...).
+                      const appPathBase =
+                        appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
+                      const rewritten = injected.replace(
+                        /((?:src|href|action)=["'])(\/[^"']*)/gi,
+                        (match, attr: string, url: string) => {
+                          if (url.startsWith('//')) return match // protocol-relative
+                          if (url.startsWith(proxyPathPrefix)) return match // already proxied
+                          let suffix: string
+                          if (!appPathBase) {
+                            suffix = url
+                          } else if (url.startsWith(appPathBase + '/')) {
+                            suffix = url.slice(appPathBase.length)
+                          } else if (url === appPathBase) {
+                            suffix = '/'
+                          } else {
+                            suffix = `${ROOT_ESCAPE}${url}`
+                          }
+                          return `${attr}${proxyPathPrefix}${suffix}`
+                        },
+                      )
+                      const buf = Buffer.from(rewritten, 'utf-8')
+                      const headers = { ...proxyRes.headers }
+                      delete headers['content-encoding'] // we decompressed
+                      delete headers['transfer-encoding']
+                      headers['content-length'] = String(buf.length)
+                      res.writeHead(status, headers)
+                      res.end(buf)
+                    })
+                    stream.on('error', () => {
+                      if (!res.headersSent) {
+                        res.writeHead(502, { 'Content-Type': 'text/plain' })
+                      }
+                      res.end('Bad Gateway: decompression error')
+                    })
+                    return
                   }
                 }
 
-                if (ct.includes('text/html')) {
-                  // HTML: decompress if needed, inject path-rewriting script, then send.
-                  const encoding = String(proxyRes.headers['content-encoding'] ?? '').toLowerCase()
-                  const stream: NodeJS.ReadableStream =
-                    encoding === 'gzip' || encoding === 'x-gzip'
-                      ? proxyRes.pipe(createGunzip())
-                      : encoding === 'deflate'
-                        ? proxyRes.pipe(createInflate())
-                        : encoding === 'br'
-                          ? proxyRes.pipe(createBrotliDecompress())
-                          : proxyRes
-                  const chunks: Buffer[] = []
-                  stream.on('data', (chunk: Buffer) => {
-                    chunks.push(chunk)
-                  })
-                  stream.on('end', () => {
-                    const html = Buffer.concat(chunks).toString('utf-8')
-                    const script = buildRewriteScript(proxyPathPrefix, appConfig.path)
-                    const injected = html.replace(/<head[^>]*>/i, (m) => m + script)
-                    // Rewrite absolute-path src/href/action attributes so static assets
-                    // and form actions route through the proxy instead of hitting the
-                    // host root.  Protocol-relative URLs (//…) are left untouched.
-                    // When the app has a configured base path (e.g. /grafana), strip it
-                    // from matching URLs before prepending the proxy prefix to prevent
-                    // double-prefixing (e.g. /grafana/d/... → /proxy/grafana/d/..., not
-                    // /proxy/grafana/grafana/d/...).
-                    const appPathBase =
-                      appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
-                    const rewritten = injected.replace(
-                      /((?:src|href|action)=["'])(\/[^"']*)/gi,
-                      (match, attr: string, url: string) => {
-                        if (url.startsWith('//')) return match // protocol-relative
-                        if (url.startsWith(proxyPathPrefix)) return match // already proxied
-                        let suffix: string
-                        if (!appPathBase) {
-                          suffix = url
-                        } else if (url.startsWith(appPathBase + '/')) {
-                          suffix = url.slice(appPathBase.length)
-                        } else if (url === appPathBase) {
-                          suffix = '/'
-                        } else {
-                          suffix = `${ROOT_ESCAPE}${url}`
-                        }
-                        return `${attr}${proxyPathPrefix}${suffix}`
-                      },
-                    )
-                    const buf = Buffer.from(rewritten, 'utf-8')
-                    const headers = { ...proxyRes.headers }
-                    delete headers['content-encoding'] // we decompressed
-                    delete headers['transfer-encoding']
-                    headers['content-length'] = String(buf.length)
-                    res.writeHead(status, headers)
-                    res.end(buf)
-                  })
-                  stream.on('error', () => {
-                    if (!res.headersSent) {
-                      res.writeHead(502, { 'Content-Type': 'text/plain' })
-                    }
-                    res.end('Bad Gateway: decompression error')
-                  })
+                // Stream response directly, preserving all original headers
+                // (including Content-Type).
+                const headers = { ...proxyRes.headers }
+                delete headers['transfer-encoding']
+                res.writeHead(status, headers)
+                proxyRes.pipe(res)
+              },
+              error(err: Error, _req: IncomingMessage, res: ServerResponse | Socket): void {
+                app.error(`Web proxy error: ${err.message}`)
+                if (res instanceof Socket) {
+                  res.destroy()
                   return
                 }
-              }
-
-              // Stream response directly, preserving all original headers
-              // (including Content-Type).
-              const headers = { ...proxyRes.headers }
-              delete headers['transfer-encoding']
-              res.writeHead(status, headers)
-              proxyRes.pipe(res)
+                if (res.headersSent) {
+                  res.end()
+                  return
+                }
+                res.writeHead(502, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ error: 'Application is not reachable' }))
+              },
             },
-            error(err: Error, _req: IncomingMessage, res: ServerResponse | Socket): void {
-              app.error(`Web proxy error: ${err.message}`)
-              if (res instanceof Socket) {
-                res.destroy()
-                return
-              }
-              if (res.headersSent) {
-                res.end()
-                return
-              }
-              res.writeHead(502, { 'Content-Type': 'application/json' })
-              res.end(JSON.stringify({ error: 'Application is not reachable' }))
-            },
-          },
-        })
+          })
         const needsRoot = appConfig.rewritePaths && appConfig.path !== '/'
         return {
           main: makeProxy(buildTarget(appConfig), appConfig.rewritePaths),
@@ -606,8 +612,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
           }
           let afterAppId = slash >= 0 ? pathPart.substring(slash) : '/'
           // Root escape: strip the /__root__ marker and dispatch via the host-only proxy.
-          const useRoot =
-            afterAppId === ROOT_ESCAPE || afterAppId.startsWith(ROOT_ESCAPE + '/')
+          const useRoot = afterAppId === ROOT_ESCAPE || afterAppId.startsWith(ROOT_ESCAPE + '/')
           if (useRoot) {
             afterAppId = afterAppId.slice(ROOT_ESCAPE.length) || '/'
           }
