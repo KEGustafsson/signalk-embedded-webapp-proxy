@@ -35,9 +35,11 @@ function oneApp(overrides: Record<string, unknown> = {}): object {
 
 type ProxyReqFn = (proxyReq: { setHeader: jest.Mock }, req: unknown) => void
 
-/** Extracts the proxyReq handler from the most recent createProxyMiddleware call. */
+/** Extracts the proxyReq handler from the *main* (first) createProxyMiddleware call.
+ * When an app has a path-scoped target plus rewritePaths, the plugin creates a second
+ * host-only proxy (call index 1) — tests that probe rewrite behavior want the first. */
 function extractProxyReqHandler(): ProxyReqFn {
-  const options = (mockCreateProxyMiddleware.mock.calls.at(-1) as [Record<string, unknown>])[0]
+  const options = (mockCreateProxyMiddleware.mock.calls[0] as [Record<string, unknown>])[0]
   return (options['on'] as Record<string, unknown>)['proxyReq'] as ProxyReqFn
 }
 
@@ -1250,7 +1252,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
     type ProxyResFn = (proxyRes: IncomingMessage, req: IncomingMessage, res: unknown) => void
 
     function extractProxyResHandler(): ProxyResFn {
-      const options = (mockCreateProxyMiddleware.mock.calls.at(-1) as [Record<string, unknown>])[0]
+      const options = (mockCreateProxyMiddleware.mock.calls[0] as [Record<string, unknown>])[0]
       return (options['on'] as Record<string, unknown>)['proxyRes'] as ProxyResFn
     }
 
@@ -1786,7 +1788,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(out).not.toContain('/grafana/grafana/')
     })
 
-    it('rewrites attributes that do not start with app base path normally', async () => {
+    it('rewrites attributes outside app base path via root-escape prefix', async () => {
       plugin.start(
         {
           apps: [
@@ -1808,7 +1810,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       )
 
       expect(body.toString()).toContain(
-        'src="/plugins/signalk-embedded-webapp-proxy/proxy/grafana/other/asset.js"',
+        'src="/plugins/signalk-embedded-webapp-proxy/proxy/grafana/__root__/other/asset.js"',
       )
     })
 
@@ -1835,7 +1837,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       )
 
       expect(body.toString()).toContain(
-        'src="/plugins/signalk-embedded-webapp-proxy/proxy/grafana/grafanaextra/app.js"',
+        'src="/plugins/signalk-embedded-webapp-proxy/proxy/grafana/__root__/grafanaextra/app.js"',
       )
     })
 

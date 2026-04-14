@@ -44,6 +44,12 @@ const APP_PATH_PATTERN = /^[a-zA-Z][a-zA-Z0-9-]*$/
 const PROXY_SUBPATH = '/proxy'
 const PLUGIN_PATH_PREFIX = `/plugins/${PLUGIN_ID}`
 
+// Escape segment used to route paths that fall outside the app's configured
+// base path directly to the target host root. The rewrite script emits
+// /<proxyPrefix>/__root__/<path> for those URLs; the HTTP and WS upgrade
+// handlers strip the marker and dispatch to a host-only proxy.
+const ROOT_ESCAPE = '/__root__'
+
 function stripInvalidHeaders(req: IncomingMessage): void {
   if (!req.headers) return
   for (const key of Object.keys(req.headers)) {
@@ -69,6 +75,12 @@ function buildTarget(appConfig: AppConfig): string {
   // A root path '/' becomes '' so the target is scheme://host:port with no path suffix.
   const path = appConfig.path.replace(/\/$/, '')
   return `${appConfig.scheme}://${appConfig.host}:${String(appConfig.port)}${path}`
+}
+
+function buildRootTarget(appConfig: AppConfig): string {
+  // Host-only target for root-escaped requests (e.g. /plugins/<other>/ws calls
+  // from within a path-scoped proxied webapp).
+  return `${appConfig.scheme}://${appConfig.host}:${String(appConfig.port)}`
 }
 
 function parseAppConfig(raw: Record<string, unknown>, index: number): AppConfig {
@@ -206,21 +218,39 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     '(function(){' +
     `var P=${prefix};` +
     `var B=${baseJson};` +
-    // N: strip app base path prefix so we don't double-prefix (e.g. /grafana/d/... → /d/...)
-    'function N(s){if(B){if(s.indexOf(B+"/")===0)return s.slice(B.length);if(s===B)return "/"}return s}' +
+    // T: transform a root-relative path into the suffix that follows the proxy prefix.
+    //    - Inside B (app base): strip B so the upstream target's base path isn't double-prefixed.
+    //    - Outside B: prepend the __root__ escape so the server routes the request via the
+    //      host-only proxy (e.g. /plugins/<other>/ws reaches the host root, not target+path).
+    //    - When B is empty, the target has no base path so nothing to strip or escape.
+    'function T(s){if(!B)return s;' +
+    'if(s.indexOf(B+"/")===0)return s.slice(B.length);' +
+    'if(s===B)return "/";' +
+    'return "/__root__"+s}' +
     // R: true for root-relative paths (/foo) but not protocol-relative (//host) or already-proxied
     "function R(s){return typeof s==='string'&&s.charAt(0)==='/'&&s.charAt(1)!=='/'&&s.indexOf(P)!==0}" +
+    // X: normalize a URL string (root-relative OR absolute same-origin) and apply
+    // proxy prefix + T. Returns input unchanged if it's not something we rewrite.
+    'function Y(s){if(typeof s!=="string")return s;' +
+    'if(s.indexOf(P)===0)return s;' +
+    'var p=null;' +
+    'if(s.charAt(0)==="/"&&s.charAt(1)!=="/")p=s;' +
+    'else{var mm=s.match(/^https?:\\/\\/([^\\/?#]+)(.*)$/);' +
+    'if(mm&&mm[1]===location.host)p=mm[2]||"/"}' +
+    'if(p===null)return s;' +
+    'if(p.indexOf(P)===0)return s;' +
+    'return P+T(p)}' +
     // --- fetch ---
     'var F=window.fetch;' +
     'window.fetch=function(u){' +
-    'if(R(u)){var a=[P+N(u)];for(var i=1;i<arguments.length;i++)a.push(arguments[i]);' +
+    'var nu=Y(u);if(nu!==u){var a=[nu];for(var i=1;i<arguments.length;i++)a.push(arguments[i]);' +
     'return F.apply(this,a)}' +
     'return F.apply(this,arguments)};' +
     // --- XMLHttpRequest ---
     'var X=XMLHttpRequest.prototype.open;' +
     'XMLHttpRequest.prototype.open=function(){' +
     'var a=[].slice.call(arguments);' +
-    'if(R(a[1]))a[1]=P+N(a[1]);' +
+    'if(typeof a[1]==="string")a[1]=Y(a[1]);' +
     'return X.apply(this,a)};' +
     // --- WebSocket ---
     // Apps often build WS URLs as full strings (ws://<location.host>/path) before
@@ -233,9 +263,9 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     'var m=u.match(/^wss?:\\/\\/([^/?#]+)([/?#].*)?$/);' +
     'if(m&&m[1]===l.host){var pt=m[2]||"/";' +
     'if(pt.charAt(0)==="/"&&pt.indexOf(P)!==0)' +
-    "u=(l.protocol==='https:'?'wss:':'ws:')+'//'+l.host+P+N(pt)}" +
+    "u=(l.protocol==='https:'?'wss:':'ws:')+'//'+l.host+P+T(pt)}" +
     'else if(R(u))' +
-    "u=(l.protocol==='https:'?'wss:':'ws:')+'//'+l.host+P+N(u)}" +
+    "u=(l.protocol==='https:'?'wss:':'ws:')+'//'+l.host+P+T(u)}" +
     'return p!==undefined?new W(u,p):new W(u)};' +
     'window.WebSocket.prototype=W.prototype;' +
     'window.WebSocket.CONNECTING=W.CONNECTING;' +
@@ -249,14 +279,14 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     'var H=window.history;if(H&&H.pushState){' +
     'var OP=H.pushState.bind(H);' +
     'var OR=H.replaceState.bind(H);' +
-    'H.pushState=function(s,t,u){if(R(u))u=P+N(u);return OP(s,t,u)};' +
-    'H.replaceState=function(s,t,u){if(R(u))u=P+N(u);return OR(s,t,u)};}' +
+    'H.pushState=function(s,t,u){if(typeof u==="string")u=Y(u);return OP(s,t,u)};' +
+    'H.replaceState=function(s,t,u){if(typeof u==="string")u=Y(u);return OR(s,t,u)};}' +
     // --- window.location.assign / replace ---
     // Catch hard-redirect style navigation (location.assign('/login')).
     'try{var L=window.location;' +
     'var LA=L.assign.bind(L);var LR=L.replace.bind(L);' +
-    'L.assign=function(u){if(R(u))u=P+N(u);return LA(u)};' +
-    'L.replace=function(u){if(R(u))u=P+N(u);return LR(u)};}catch(e){}' +
+    'L.assign=function(u){if(typeof u==="string")u=Y(u);return LA(u)};' +
+    'L.replace=function(u){if(typeof u==="string")u=Y(u);return LR(u)};}catch(e){}' +
     // --- Location.prototype.href setter ---
     // Intercept location.href = '/path' so it navigates through the proxy.
     // The getter is NOT overridden — Angular and other frameworks need the
@@ -265,8 +295,48 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     'var hD=Object.getOwnPropertyDescriptor(LP,"href");' +
     'if(hD&&hD.set){var hS=hD.set;' +
     'Object.defineProperty(LP,"href",{get:hD.get,' +
-    'set:function(v){if(R(v))v=P+N(v);return hS.call(this,v)},' +
+    'set:function(v){if(typeof v==="string")v=Y(v);return hS.call(this,v)},' +
     'configurable:true,enumerable:true})}' +
+    '}catch(e){}' +
+    // --- HTMLImageElement.prototype.src setter ---
+    // MutationObserver fires asynchronously, so by the time we rewrite an
+    // attribute mutation the browser has already kicked off the image request
+    // with the unrewritten URL.  Override the src setter synchronously so
+    // img.src = "/plugins/foo/snapshot" is rewritten before the request fires.
+    'try{var imgEls=[window.HTMLImageElement,window.HTMLSourceElement,window.HTMLIFrameElement];' +
+    'for(var ii=0;ii<imgEls.length;ii++){var EC=imgEls[ii];if(!EC)continue;' +
+    'var sD=Object.getOwnPropertyDescriptor(EC.prototype,"src");' +
+    'if(sD&&sD.set){(function(EC,sD){var sS=sD.set;' +
+    'Object.defineProperty(EC.prototype,"src",{get:sD.get,' +
+    'set:function(v){if(typeof v==="string")v=Y(v);return sS.call(this,v)},' +
+    'configurable:true,enumerable:true})})(EC,sD)}}}catch(e){}' +
+    // --- Element.prototype.setAttribute override ---
+    // Synchronously rewrite src/href/action attribute values so assignments
+    // via setAttribute (not just the property setter) are caught before the
+    // browser fires any network request they trigger.
+    'try{var SA=Element.prototype.setAttribute;' +
+    'Element.prototype.setAttribute=function(n,v){' +
+    'if(typeof n==="string"&&typeof v==="string"){' +
+    'var ln=n.toLowerCase();' +
+    'if(ln==="src"||ln==="href"||ln==="action"||ln==="formaction")v=Y(v)}' +
+    'return SA.call(this,n,v)};}catch(e){}' +
+    // --- innerHTML / outerHTML / insertAdjacentHTML ---
+    // HTML parsed via innerHTML creates elements with src/href already set, and
+    // the browser fires the network request synchronously during parsing.
+    // Rewrite matching attribute values in the HTML string itself so the parser
+    // sees the proxy-prefixed URL.
+    'function RH(h){if(typeof h!=="string")return h;' +
+    'return h.replace(/(\\s(?:src|href|action|formaction)\\s*=\\s*)("([^"]*)"|\'([^\']*)\'|([^\\s>]+))/gi,' +
+    'function(_,pre,_all,dq,sq,uq){var q="\\"",v=dq;if(sq!==undefined){q="\'";v=sq}else if(uq!==undefined){q="";v=uq}' +
+    'v=Y(v);return pre+q+v+q})}' +
+    'try{var IH=Object.getOwnPropertyDescriptor(Element.prototype,"innerHTML");' +
+    'if(IH&&IH.set){var IHs=IH.set;Object.defineProperty(Element.prototype,"innerHTML",{get:IH.get,' +
+    'set:function(v){return IHs.call(this,RH(v))},configurable:true,enumerable:true})}' +
+    'var OH=Object.getOwnPropertyDescriptor(Element.prototype,"outerHTML");' +
+    'if(OH&&OH.set){var OHs=OH.set;Object.defineProperty(Element.prototype,"outerHTML",{get:OH.get,' +
+    'set:function(v){return OHs.call(this,RH(v))},configurable:true,enumerable:true})}' +
+    'var IA=Element.prototype.insertAdjacentHTML;' +
+    'if(IA){Element.prototype.insertAdjacentHTML=function(p,h){return IA.call(this,p,RH(h))}}' +
     '}catch(e){}' +
     // --- DOM MutationObserver ---
     // Rewrite href/src/action attributes on dynamically added elements so
@@ -278,16 +348,16 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     'function RW(el){' +
     'if(el.nodeType!==1)return;' +
     'var aa=["href","src","action"];' +
-    'for(var i=0;i<aa.length;i++){var v=el.getAttribute(aa[i]);if(v&&R(v))el.setAttribute(aa[i],P+N(v))}' +
+    'for(var i=0;i<aa.length;i++){var v=el.getAttribute(aa[i]);if(v){var nv=Y(v);if(nv!==v)el.setAttribute(aa[i],nv)}}' +
     'var ch=el.querySelectorAll?el.querySelectorAll("[href],[src],[action]"):[];' +
     'for(var j=0;j<ch.length;j++){' +
-    'for(var k=0;k<aa.length;k++){var w=ch[j].getAttribute(aa[k]);if(w&&R(w))ch[j].setAttribute(aa[k],P+N(w))}' +
+    'for(var k=0;k<aa.length;k++){var w=ch[j].getAttribute(aa[k]);if(w){var nw=Y(w);if(nw!==w)ch[j].setAttribute(aa[k],nw)}}' +
     '}}' +
     'var MO=window.MutationObserver;if(MO){' +
     'new MO(function(ms){for(var i=0;i<ms.length;i++){var m=ms[i];' +
     'if(m.type==="childList"){for(var j=0;j<m.addedNodes.length;j++)RW(m.addedNodes[j])}' +
     'else if(m.type==="attributes"){var v=m.target.getAttribute(m.attributeName);' +
-    'if(v&&R(v))m.target.setAttribute(m.attributeName,P+N(v))}' +
+    'if(v){var nv2=Y(v);if(nv2!==v)m.target.setAttribute(m.attributeName,nv2)}}' +
     '}}).observe(document.documentElement,{childList:true,subtree:true,' +
     'attributes:true,attributeFilter:["href","src","action"]})}' +
     '})()' +
@@ -295,8 +365,16 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
   )
 }
 
+interface ProxyPair {
+  main: RequestHandler
+  // Host-only proxy for /__root__-escaped requests. Only created when the app
+  // target has a non-root base path AND rewritePaths is enabled — otherwise no
+  // /__root__ URLs are ever generated and the secondary proxy is redundant.
+  root?: RequestHandler
+}
+
 module.exports = function (app: ServerAPIWithServer): Plugin {
-  let proxies: RequestHandler[] = []
+  let proxies: ProxyPair[] = []
   let currentApps: AppConfig[] = []
   let started = false
   let upgradeHandler: ((req: IncomingMessage, socket: Socket, head: Buffer) => void) | null = null
@@ -319,9 +397,9 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
 
       proxies = currentApps.map((appConfig, appIndex) => {
         const proxyPathPrefix = `${PLUGIN_PATH_PREFIX}${PROXY_SUBPATH}/${appConfig.appPath || String(appIndex)}`
-
-        return createProxyMiddleware({
-          target: buildTarget(appConfig),
+        const makeProxy = (target: string, enableRewrite: boolean): RequestHandler =>
+          createProxyMiddleware({
+          target,
           changeOrigin: true,
           ws: false,
           secure: !(appConfig.scheme === 'https' && appConfig.allowSelfSigned),
@@ -344,7 +422,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                 rawProto.split(',')[0]?.trim() ||
                 ((req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http')
               proxyReq.setHeader('X-Forwarded-Proto', proto)
-              if (appConfig.rewritePaths) {
+              if (enableRewrite) {
                 // Constrain Accept-Encoding to encodings we can decompress for HTML
                 // script injection (br, gzip, deflate). Must honor what the *client*
                 // accepts — if we upgrade the client's Accept-Encoding and upstream
@@ -375,7 +453,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
               const ct = String(proxyRes.headers['content-type'] ?? '')
               const status = proxyRes.statusCode ?? 200
 
-              if (appConfig.rewritePaths) {
+              if (enableRewrite) {
                 // Rewrite Location headers on redirects so the browser
                 // follows through the proxy instead of hitting the host root.
                 // e.g. "Location: /grafana/login" → "Location: /plugins/signalk-embedded-webapp-proxy/proxy/grafana/login"
@@ -389,13 +467,17 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                   ) {
                     const appPathBase =
                       appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
-                    const normalizedLoc =
-                      appPathBase && loc.startsWith(appPathBase + '/')
-                        ? loc.slice(appPathBase.length)
-                        : appPathBase && loc === appPathBase
-                          ? '/'
-                          : loc
-                    proxyRes.headers['location'] = `${proxyPathPrefix}${normalizedLoc}`
+                    let suffix: string
+                    if (!appPathBase) {
+                      suffix = loc
+                    } else if (loc.startsWith(appPathBase + '/')) {
+                      suffix = loc.slice(appPathBase.length)
+                    } else if (loc === appPathBase) {
+                      suffix = '/'
+                    } else {
+                      suffix = `${ROOT_ESCAPE}${loc}`
+                    }
+                    proxyRes.headers['location'] = `${proxyPathPrefix}${suffix}`
                   }
                 }
 
@@ -432,13 +514,17 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                       (match, attr: string, url: string) => {
                         if (url.startsWith('//')) return match // protocol-relative
                         if (url.startsWith(proxyPathPrefix)) return match // already proxied
-                        const normalizedUrl =
-                          appPathBase && url.startsWith(appPathBase + '/')
-                            ? url.slice(appPathBase.length)
-                            : appPathBase && url === appPathBase
-                              ? '/'
-                              : url
-                        return `${attr}${proxyPathPrefix}${normalizedUrl}`
+                        let suffix: string
+                        if (!appPathBase) {
+                          suffix = url
+                        } else if (url.startsWith(appPathBase + '/')) {
+                          suffix = url.slice(appPathBase.length)
+                        } else if (url === appPathBase) {
+                          suffix = '/'
+                        } else {
+                          suffix = `${ROOT_ESCAPE}${url}`
+                        }
+                        return `${attr}${proxyPathPrefix}${suffix}`
                       },
                     )
                     const buf = Buffer.from(rewritten, 'utf-8')
@@ -481,6 +567,11 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
             },
           },
         })
+        const needsRoot = appConfig.rewritePaths && appConfig.path !== '/'
+        return {
+          main: makeProxy(buildTarget(appConfig), appConfig.rewritePaths),
+          ...(needsRoot ? { root: makeProxy(buildRootTarget(appConfig), false) } : {}),
+        }
       })
 
       started = true
@@ -508,7 +599,19 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
             reject404()
             return
           }
-          const targetProxy = proxies[index]
+          const pair = proxies[index]
+          if (!pair) {
+            reject404()
+            return
+          }
+          let afterAppId = slash >= 0 ? pathPart.substring(slash) : '/'
+          // Root escape: strip the /__root__ marker and dispatch via the host-only proxy.
+          const useRoot =
+            afterAppId === ROOT_ESCAPE || afterAppId.startsWith(ROOT_ESCAPE + '/')
+          if (useRoot) {
+            afterAppId = afterAppId.slice(ROOT_ESCAPE.length) || '/'
+          }
+          const targetProxy = useRoot ? pair.root : pair.main
           if (!targetProxy) {
             reject404()
             return
@@ -519,7 +622,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
             return
           }
           stripInvalidHeaders(req)
-          req.url = (slash >= 0 ? pathPart.substring(slash) : '/') + queryString
+          req.url = afterAppId + queryString
           proxyUpgrade.call(targetProxy, req, socket, head)
         }
         app.server.on('upgrade', upgradeHandler)
@@ -560,12 +663,29 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
             return
           }
           const idx = resolveAppIndex(appId, currentApps)
-          const proxy = idx >= 0 && idx < proxies.length ? proxies[idx] : undefined
-          if (proxy) {
-            ;(proxy as (req: Request, res: Response, next: () => void) => void)(req, res, next)
-          } else {
+          const pair = idx >= 0 && idx < proxies.length ? proxies[idx] : undefined
+          if (!pair) {
             res.status(404).json({ error: `No app found for "${appId}"` })
+            return
           }
+          // After express has matched /proxy/:appId, req.url is the remaining
+          // suffix (e.g. "/__root__/plugins/foo/ws" or "/api/bar"). Strip the
+          // root escape and dispatch to the host-only proxy when present.
+          const u = req.url ?? ''
+          const useRoot = u === ROOT_ESCAPE || u.startsWith(ROOT_ESCAPE + '/')
+          if (useRoot) {
+            req.url = u.slice(ROOT_ESCAPE.length) || '/'
+          }
+          const proxy = useRoot ? pair.root : pair.main
+          if (!proxy) {
+            res.status(404).json({ error: `No app found for "${appId}"` })
+            return
+          }
+          ;(proxy as unknown as (req: Request, res: Response, next: () => void) => void)(
+            req,
+            res,
+            next,
+          )
         },
       )
     },
