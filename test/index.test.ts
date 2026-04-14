@@ -1555,11 +1555,9 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       plugin.start(oneApp({ rewritePaths: true }), jest.fn())
       const handler = extractProxyResHandler()
 
-      const { res } = await runHtmlProxyRes(
-        handler,
-        '<html><head></head><body></body></html>',
-        { contentType: 'text/html; charset=utf-8' },
-      )
+      const { res } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>', {
+        contentType: 'text/html; charset=utf-8',
+      })
 
       expect(res.writeHead).toHaveBeenCalledWith(
         200,

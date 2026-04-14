@@ -346,11 +346,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
               // locks headers; calling setHeader afterwards throws ERR_HTTP_HEADERS_SENT.
               fixRequestBody(proxyReq, req)
             },
-            proxyRes(
-              proxyRes: IncomingMessage,
-              _req: IncomingMessage,
-              res: ServerResponse,
-            ): void {
+            proxyRes(proxyRes: IncomingMessage, _req: IncomingMessage, res: ServerResponse): void {
               const ct = String(proxyRes.headers['content-type'] ?? '')
               const status = proxyRes.statusCode ?? 200
 
@@ -380,9 +376,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
 
                 if (ct.includes('text/html')) {
                   // HTML: decompress if needed, inject path-rewriting script, then send.
-                  const encoding = String(
-                    proxyRes.headers['content-encoding'] ?? '',
-                  ).toLowerCase()
+                  const encoding = String(proxyRes.headers['content-encoding'] ?? '').toLowerCase()
                   const stream: NodeJS.ReadableStream =
                     encoding === 'gzip' || encoding === 'x-gzip'
                       ? proxyRes.pipe(createGunzip())
