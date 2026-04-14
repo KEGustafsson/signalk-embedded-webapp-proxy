@@ -223,9 +223,18 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     'if(R(a[1]))a[1]=P+N(a[1]);' +
     'return X.apply(this,a)};' +
     // --- WebSocket ---
+    // Apps often build WS URLs as full strings (ws://<location.host>/path) before
+    // calling new WebSocket(), so we also match full ws(s):// URLs whose host
+    // matches the current page host and rewrite them through the proxy.
     'var W=window.WebSocket;if(W){' +
     'window.WebSocket=function(u,p){' +
-    'if(R(u)){var l=window.location;' +
+    'var l=window.location;' +
+    'if(typeof u==="string"){' +
+    'var m=u.match(/^wss?:\\/\\/([^/?#]+)([/?#].*)?$/);' +
+    'if(m&&m[1]===l.host){var pt=m[2]||"/";' +
+    'if(pt.charAt(0)==="/"&&pt.indexOf(P)!==0)' +
+    "u=(l.protocol==='https:'?'wss:':'ws:')+'//'+l.host+P+N(pt)}" +
+    'else if(R(u))' +
     "u=(l.protocol==='https:'?'wss:':'ws:')+'//'+l.host+P+N(u)}" +
     'return p!==undefined?new W(u,p):new W(u)};' +
     'window.WebSocket.prototype=W.prototype;' +
@@ -336,8 +345,24 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                 ((req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http')
               proxyReq.setHeader('X-Forwarded-Proto', proto)
               if (appConfig.rewritePaths) {
-                // Only advertise encodings we can decompress for HTML script injection.
-                proxyReq.setHeader('Accept-Encoding', 'gzip, deflate, br, identity')
+                // Constrain Accept-Encoding to encodings we can decompress for HTML
+                // script injection (br, gzip, deflate). Must honor what the *client*
+                // accepts — if we upgrade the client's Accept-Encoding and upstream
+                // compresses, the client will receive bytes it can't decode (e.g. a
+                // sandboxed iframe module import that sent Accept-Encoding: identity
+                // would see raw brotli and fail with an illegal-character error).
+                const clientAE = String(req.headers['accept-encoding'] ?? '')
+                  .toLowerCase()
+                  .split(',')
+                  .map((s) => s.split(';')[0]!.trim())
+                  .filter(Boolean)
+                const supported = clientAE.filter((e) =>
+                  ['gzip', 'deflate', 'br', 'identity'].includes(e),
+                )
+                proxyReq.setHeader(
+                  'Accept-Encoding',
+                  supported.length > 0 ? supported.join(', ') : 'identity',
+                )
               }
               // Re-stream the request body when an upstream body-parser
               // (e.g. SignalK's global bodyParser.json()) has already

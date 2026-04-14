@@ -313,6 +313,50 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(headerMap['X-Forwarded-Proto']).toBe('http')
     })
 
+    it('constrains upstream Accept-Encoding to client-accepted encodings we can decompress', () => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const proxyReqHandler = extractProxyReqHandler()
+
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqHandler(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.1' },
+        headers: { 'accept-encoding': 'gzip, deflate, br, zstd' },
+      })
+      const calls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      const ae = Object.fromEntries(calls.map(([k, v]) => [k, v]))['Accept-Encoding']
+      expect(ae).toBe('gzip, deflate, br')
+    })
+
+    it('falls back to identity when client Accept-Encoding has nothing we can decompress', () => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const proxyReqHandler = extractProxyReqHandler()
+
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqHandler(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.1' },
+        headers: { 'accept-encoding': 'zstd' },
+      })
+      const calls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      const ae = Object.fromEntries(calls.map(([k, v]) => [k, v]))['Accept-Encoding']
+      expect(ae).toBe('identity')
+    })
+
+    it('does not override Accept-Encoding when rewritePaths is disabled', () => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+      plugin.start(oneApp(), jest.fn())
+      const proxyReqHandler = extractProxyReqHandler()
+
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqHandler(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.1' },
+        headers: { 'accept-encoding': 'gzip, deflate, br, zstd' },
+      })
+      const calls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      expect(calls.find(([k]) => k === 'Accept-Encoding')).toBeUndefined()
+    })
+
     it('appends to existing X-Forwarded-For header', () => {
       mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
 
@@ -1339,6 +1383,59 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(body.toString()).toContain(
         '<script data-signalk-embedded-webapp-proxy="path-rewrite">',
       )
+    })
+
+    it('rewrites WebSocket URLs (absolute ws:// to current host and root-relative paths)', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
+      const html = body.toString()
+      const scriptMatch = html.match(
+        /<script data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/,
+      )
+      expect(scriptMatch).not.toBeNull()
+      const scriptBody = scriptMatch![1]!
+
+      // Simulate the browser environment the IIFE expects.
+      const created: string[] = []
+      class FakeWS {
+        constructor(url: string) {
+          created.push(url)
+        }
+      }
+      const sandbox = {
+        window: {
+          WebSocket: FakeWS,
+          fetch: () => {},
+          location: { protocol: 'http:', host: '192.168.100.10:3000', assign() {}, replace() {} },
+          history: null,
+          MutationObserver: null,
+        } as Record<string, unknown>,
+        XMLHttpRequest: { prototype: { open() {} } },
+        Location: { prototype: {} },
+        Object,
+      }
+      ;(sandbox.window as Record<string, unknown>).WebSocket = FakeWS
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const vm = require('vm') as typeof import('vm')
+      vm.createContext(sandbox)
+      vm.runInContext(scriptBody, sandbox)
+
+      const W = (sandbox.window as { WebSocket: new (u: string) => unknown }).WebSocket
+      new W('ws://192.168.100.10:3000/plugins/signalk-onvif-camera/ws')
+      new W('/api/stream')
+      new W('wss://other.example.com/socket')
+      new W('/plugins/signalk-embedded-webapp-proxy/proxy/0/already')
+
+      expect(created[0]).toBe(
+        'ws://192.168.100.10:3000/plugins/signalk-embedded-webapp-proxy/proxy/0/plugins/signalk-onvif-camera/ws',
+      )
+      expect(created[1]).toBe(
+        'ws://192.168.100.10:3000/plugins/signalk-embedded-webapp-proxy/proxy/0/api/stream',
+      )
+      expect(created[2]).toBe('wss://other.example.com/socket')
+      expect(created[3]).toBe('/plugins/signalk-embedded-webapp-proxy/proxy/0/already')
     })
 
     it('uses appPath in the rewritten attribute prefix', async () => {
