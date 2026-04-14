@@ -317,9 +317,10 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
           ws: false,
           secure: !(appConfig.scheme === 'https' && appConfig.allowSelfSigned),
           ...(appConfig.timeout > 0 ? { proxyTimeout: appConfig.timeout } : {}),
-          // selfHandleResponse is required so the proxyRes handler below can
-          // choose between streaming non-HTML responses and buffering HTML ones.
-          ...(appConfig.rewritePaths ? { selfHandleResponse: true } : {}),
+          // Always self-handle responses so upstream headers (especially
+          // Content-Type) are forwarded faithfully and not overwritten by
+          // middleware in the pipeline.
+          selfHandleResponse: true,
           on: {
             proxyReq(proxyReq, req): void {
               const remoteAddress = req.socket?.remoteAddress ?? ''
@@ -345,108 +346,107 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
               // locks headers; calling setHeader afterwards throws ERR_HTTP_HEADERS_SENT.
               fixRequestBody(proxyReq, req)
             },
-            ...(appConfig.rewritePaths
-              ? {
-                  proxyRes(
-                    proxyRes: IncomingMessage,
-                    _req: IncomingMessage,
-                    res: ServerResponse,
-                  ): void {
-                    const ct = String(proxyRes.headers['content-type'] ?? '')
-                    const status = proxyRes.statusCode ?? 200
+            proxyRes(
+              proxyRes: IncomingMessage,
+              _req: IncomingMessage,
+              res: ServerResponse,
+            ): void {
+              const ct = String(proxyRes.headers['content-type'] ?? '')
+              const status = proxyRes.statusCode ?? 200
 
-                    // Rewrite Location headers on redirects so the browser
-                    // follows through the proxy instead of hitting the host root.
-                    // e.g. "Location: /grafana/login" → "Location: /plugins/signalk-embedded-webapp-proxy/proxy/grafana/login"
-                    if (proxyRes.headers['location']) {
-                      const loc = String(proxyRes.headers['location'])
-                      // Only rewrite root-relative paths (not absolute URLs or protocol-relative)
-                      if (
-                        loc.charAt(0) === '/' &&
-                        loc.charAt(1) !== '/' &&
-                        !loc.startsWith(proxyPathPrefix)
-                      ) {
-                        const appPathBase =
-                          appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
-                        const normalizedLoc =
-                          appPathBase && loc.startsWith(appPathBase + '/')
-                            ? loc.slice(appPathBase.length)
-                            : appPathBase && loc === appPathBase
-                              ? '/'
-                              : loc
-                        proxyRes.headers['location'] = `${proxyPathPrefix}${normalizedLoc}`
-                      }
-                    }
-
-                    if (!ct.includes('text/html')) {
-                      // Stream non-HTML (SSE, assets, API responses) directly without buffering.
-                      const headers = { ...proxyRes.headers }
-                      delete headers['transfer-encoding']
-                      res.writeHead(status, headers)
-                      proxyRes.pipe(res)
-                      return
-                    }
-
-                    // HTML: decompress if needed, inject path-rewriting script, then send.
-                    const encoding = String(
-                      proxyRes.headers['content-encoding'] ?? '',
-                    ).toLowerCase()
-                    const stream: NodeJS.ReadableStream =
-                      encoding === 'gzip' || encoding === 'x-gzip'
-                        ? proxyRes.pipe(createGunzip())
-                        : encoding === 'deflate'
-                          ? proxyRes.pipe(createInflate())
-                          : encoding === 'br'
-                            ? proxyRes.pipe(createBrotliDecompress())
-                            : proxyRes
-                    const chunks: Buffer[] = []
-                    stream.on('data', (chunk: Buffer) => {
-                      chunks.push(chunk)
-                    })
-                    stream.on('end', () => {
-                      const html = Buffer.concat(chunks).toString('utf-8')
-                      const script = buildRewriteScript(proxyPathPrefix, appConfig.path)
-                      const injected = html.replace(/<head[^>]*>/i, (m) => m + script)
-                      // Rewrite absolute-path src/href/action attributes so static assets
-                      // and form actions route through the proxy instead of hitting the
-                      // host root.  Protocol-relative URLs (//…) are left untouched.
-                      // When the app has a configured base path (e.g. /grafana), strip it
-                      // from matching URLs before prepending the proxy prefix to prevent
-                      // double-prefixing (e.g. /grafana/d/... → /proxy/grafana/d/..., not
-                      // /proxy/grafana/grafana/d/...).
-                      const appPathBase =
-                        appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
-                      const rewritten = injected.replace(
-                        /((?:src|href|action)=["'])(\/[^"']*)/gi,
-                        (match, attr: string, url: string) => {
-                          if (url.startsWith('//')) return match // protocol-relative
-                          if (url.startsWith(proxyPathPrefix)) return match // already proxied
-                          const normalizedUrl =
-                            appPathBase && url.startsWith(appPathBase + '/')
-                              ? url.slice(appPathBase.length)
-                              : appPathBase && url === appPathBase
-                                ? '/'
-                                : url
-                          return `${attr}${proxyPathPrefix}${normalizedUrl}`
-                        },
-                      )
-                      const buf = Buffer.from(rewritten, 'utf-8')
-                      const headers = { ...proxyRes.headers }
-                      delete headers['content-encoding'] // we decompressed
-                      delete headers['transfer-encoding']
-                      headers['content-length'] = String(buf.length)
-                      res.writeHead(status, headers)
-                      res.end(buf)
-                    })
-                    stream.on('error', () => {
-                      if (!res.headersSent) {
-                        res.writeHead(502, { 'Content-Type': 'text/plain' })
-                      }
-                      res.end('Bad Gateway: decompression error')
-                    })
-                  },
+              if (appConfig.rewritePaths) {
+                // Rewrite Location headers on redirects so the browser
+                // follows through the proxy instead of hitting the host root.
+                // e.g. "Location: /grafana/login" → "Location: /plugins/signalk-embedded-webapp-proxy/proxy/grafana/login"
+                if (proxyRes.headers['location']) {
+                  const loc = String(proxyRes.headers['location'])
+                  // Only rewrite root-relative paths (not absolute URLs or protocol-relative)
+                  if (
+                    loc.charAt(0) === '/' &&
+                    loc.charAt(1) !== '/' &&
+                    !loc.startsWith(proxyPathPrefix)
+                  ) {
+                    const appPathBase =
+                      appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
+                    const normalizedLoc =
+                      appPathBase && loc.startsWith(appPathBase + '/')
+                        ? loc.slice(appPathBase.length)
+                        : appPathBase && loc === appPathBase
+                          ? '/'
+                          : loc
+                    proxyRes.headers['location'] = `${proxyPathPrefix}${normalizedLoc}`
+                  }
                 }
-              : {}),
+
+                if (ct.includes('text/html')) {
+                  // HTML: decompress if needed, inject path-rewriting script, then send.
+                  const encoding = String(
+                    proxyRes.headers['content-encoding'] ?? '',
+                  ).toLowerCase()
+                  const stream: NodeJS.ReadableStream =
+                    encoding === 'gzip' || encoding === 'x-gzip'
+                      ? proxyRes.pipe(createGunzip())
+                      : encoding === 'deflate'
+                        ? proxyRes.pipe(createInflate())
+                        : encoding === 'br'
+                          ? proxyRes.pipe(createBrotliDecompress())
+                          : proxyRes
+                  const chunks: Buffer[] = []
+                  stream.on('data', (chunk: Buffer) => {
+                    chunks.push(chunk)
+                  })
+                  stream.on('end', () => {
+                    const html = Buffer.concat(chunks).toString('utf-8')
+                    const script = buildRewriteScript(proxyPathPrefix, appConfig.path)
+                    const injected = html.replace(/<head[^>]*>/i, (m) => m + script)
+                    // Rewrite absolute-path src/href/action attributes so static assets
+                    // and form actions route through the proxy instead of hitting the
+                    // host root.  Protocol-relative URLs (//…) are left untouched.
+                    // When the app has a configured base path (e.g. /grafana), strip it
+                    // from matching URLs before prepending the proxy prefix to prevent
+                    // double-prefixing (e.g. /grafana/d/... → /proxy/grafana/d/..., not
+                    // /proxy/grafana/grafana/d/...).
+                    const appPathBase =
+                      appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
+                    const rewritten = injected.replace(
+                      /((?:src|href|action)=["'])(\/[^"']*)/gi,
+                      (match, attr: string, url: string) => {
+                        if (url.startsWith('//')) return match // protocol-relative
+                        if (url.startsWith(proxyPathPrefix)) return match // already proxied
+                        const normalizedUrl =
+                          appPathBase && url.startsWith(appPathBase + '/')
+                            ? url.slice(appPathBase.length)
+                            : appPathBase && url === appPathBase
+                              ? '/'
+                              : url
+                        return `${attr}${proxyPathPrefix}${normalizedUrl}`
+                      },
+                    )
+                    const buf = Buffer.from(rewritten, 'utf-8')
+                    const headers = { ...proxyRes.headers }
+                    delete headers['content-encoding'] // we decompressed
+                    delete headers['transfer-encoding']
+                    headers['content-length'] = String(buf.length)
+                    res.writeHead(status, headers)
+                    res.end(buf)
+                  })
+                  stream.on('error', () => {
+                    if (!res.headersSent) {
+                      res.writeHead(502, { 'Content-Type': 'text/plain' })
+                    }
+                    res.end('Bad Gateway: decompression error')
+                  })
+                  return
+                }
+              }
+
+              // Stream response directly, preserving all original headers
+              // (including Content-Type).
+              const headers = { ...proxyRes.headers }
+              delete headers['transfer-encoding']
+              res.writeHead(status, headers)
+              proxyRes.pipe(res)
+            },
             error(err: Error, _req: IncomingMessage, res: ServerResponse | Socket): void {
               app.error(`Web proxy error: ${err.message}`)
               if (res instanceof Socket) {
