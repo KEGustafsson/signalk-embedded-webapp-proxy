@@ -1788,7 +1788,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(out).not.toContain('/grafana/grafana/')
     })
 
-    it('rewrites attributes outside app base path via root-escape prefix', async () => {
+    it('rewrites out-of-base non-root-namespace attributes without root-escape', async () => {
       plugin.start(
         {
           apps: [
@@ -1810,7 +1810,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       )
 
       expect(body.toString()).toContain(
-        'src="/plugins/signalk-embedded-webapp-proxy/proxy/grafana/__root__/other/asset.js"',
+        'src="/plugins/signalk-embedded-webapp-proxy/proxy/grafana/other/asset.js"',
       )
     })
 
@@ -1837,7 +1837,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       )
 
       expect(body.toString()).toContain(
-        'src="/plugins/signalk-embedded-webapp-proxy/proxy/grafana/__root__/grafanaextra/app.js"',
+        'src="/plugins/signalk-embedded-webapp-proxy/proxy/grafana/grafanaextra/app.js"',
       )
     })
 

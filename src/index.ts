@@ -50,6 +50,16 @@ const PLUGIN_PATH_PREFIX = `/plugins/${PLUGIN_ID}`
 // handlers strip the marker and dispatch to a host-only proxy.
 const ROOT_ESCAPE = '/__root__'
 
+// SignalK server root namespaces that sit above any embedded app's base path.
+// Only URLs starting with one of these get routed through the host-only proxy
+// via /__root__. Other outside-of-base URLs are left to the main proxy so
+// embedded apps with sub-path APIs (e.g. Grafana /api/...) keep working.
+const ROOT_NAMESPACES = ['/plugins/', '/signalk/', '/admin/', '/skServer/']
+
+function isRootNamespace(path: string): boolean {
+  return ROOT_NAMESPACES.some((ns) => path.startsWith(ns))
+}
+
 function stripInvalidHeaders(req: IncomingMessage): void {
   if (!req.headers) return
   for (const key of Object.keys(req.headers)) {
@@ -220,13 +230,17 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     `var B=${baseJson};` +
     // T: transform a root-relative path into the suffix that follows the proxy prefix.
     //    - Inside B (app base): strip B so the upstream target's base path isn't double-prefixed.
-    //    - Outside B: prepend the __root__ escape so the server routes the request via the
-    //      host-only proxy (e.g. /plugins/<other>/ws reaches the host root, not target+path).
+    //    - Outside B but inside a known SignalK-server root namespace (/plugins/, /signalk/,
+    //      /admin/, /skServer/): prepend __root__ so the server routes through the host-only
+    //      proxy (e.g. onvif webapp reaching /plugins/signalk-onvif-camera/ws).
+    //    - Otherwise: pass through unchanged so the main proxy forwards the path to
+    //      target+base (e.g. Grafana XHR to /api/frontend/settings → upstream /grafana/api/...).
     //    - When B is empty, the target has no base path so nothing to strip or escape.
     'function T(s){if(!B)return s;' +
     'if(s.indexOf(B+"/")===0)return s.slice(B.length);' +
     'if(s===B)return "/";' +
-    'return "/__root__"+s}' +
+    'if(s.indexOf("/plugins/")===0||s.indexOf("/signalk/")===0||s.indexOf("/admin/")===0||s.indexOf("/skServer/")===0)return "/__root__"+s;' +
+    'return s}' +
     // R: true for root-relative paths (/foo) but not protocol-relative (//host) or already-proxied
     "function R(s){return typeof s==='string'&&s.charAt(0)==='/'&&s.charAt(1)!=='/'&&s.indexOf(P)!==0}" +
     // X: normalize a URL string (root-relative OR absolute same-origin) and apply
@@ -310,34 +324,17 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     'Object.defineProperty(EC.prototype,"src",{get:sD.get,' +
     'set:function(v){if(typeof v==="string")v=Y(v);return sS.call(this,v)},' +
     'configurable:true,enumerable:true})})(EC,sD)}}}catch(e){}' +
-    // --- Element.prototype.setAttribute override ---
-    // Synchronously rewrite src/href/action attribute values so assignments
-    // via setAttribute (not just the property setter) are caught before the
-    // browser fires any network request they trigger.
+    // --- Element.prototype.setAttribute override (src only) ---
+    // Synchronously rewrite "src" so assignments via setAttribute are caught
+    // before the browser fires the resource request.  Deliberately NOT applied
+    // to href/action: doing so makes frameworks (Grafana, others) read back a
+    // proxy-prefixed value from the DOM and then re-prepend their own sub-path
+    // config, yielding a doubled prefix.  Let href/action go through the async
+    // MutationObserver path instead.
     'try{var SA=Element.prototype.setAttribute;' +
     'Element.prototype.setAttribute=function(n,v){' +
-    'if(typeof n==="string"&&typeof v==="string"){' +
-    'var ln=n.toLowerCase();' +
-    'if(ln==="src"||ln==="href"||ln==="action"||ln==="formaction")v=Y(v)}' +
+    'if(typeof n==="string"&&typeof v==="string"&&n.toLowerCase()==="src")v=Y(v);' +
     'return SA.call(this,n,v)};}catch(e){}' +
-    // --- innerHTML / outerHTML / insertAdjacentHTML ---
-    // HTML parsed via innerHTML creates elements with src/href already set, and
-    // the browser fires the network request synchronously during parsing.
-    // Rewrite matching attribute values in the HTML string itself so the parser
-    // sees the proxy-prefixed URL.
-    'function RH(h){if(typeof h!=="string")return h;' +
-    'return h.replace(/(\\s(?:src|href|action|formaction)\\s*=\\s*)("([^"]*)"|\'([^\']*)\'|([^\\s>]+))/gi,' +
-    'function(_,pre,_all,dq,sq,uq){var q="\\"",v=dq;if(sq!==undefined){q="\'";v=sq}else if(uq!==undefined){q="";v=uq}' +
-    'v=Y(v);return pre+q+v+q})}' +
-    'try{var IH=Object.getOwnPropertyDescriptor(Element.prototype,"innerHTML");' +
-    'if(IH&&IH.set){var IHs=IH.set;Object.defineProperty(Element.prototype,"innerHTML",{get:IH.get,' +
-    'set:function(v){return IHs.call(this,RH(v))},configurable:true,enumerable:true})}' +
-    'var OH=Object.getOwnPropertyDescriptor(Element.prototype,"outerHTML");' +
-    'if(OH&&OH.set){var OHs=OH.set;Object.defineProperty(Element.prototype,"outerHTML",{get:OH.get,' +
-    'set:function(v){return OHs.call(this,RH(v))},configurable:true,enumerable:true})}' +
-    'var IA=Element.prototype.insertAdjacentHTML;' +
-    'if(IA){Element.prototype.insertAdjacentHTML=function(p,h){return IA.call(this,p,RH(h))}}' +
-    '}catch(e){}' +
     // --- DOM MutationObserver ---
     // Rewrite href/src/action attributes on dynamically added elements so
     // frameworks (Angular, React) see proxy-prefixed URLs that match the
@@ -478,8 +475,10 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                         suffix = loc.slice(appPathBase.length)
                       } else if (loc === appPathBase) {
                         suffix = '/'
-                      } else {
+                      } else if (isRootNamespace(loc)) {
                         suffix = `${ROOT_ESCAPE}${loc}`
+                      } else {
+                        suffix = loc
                       }
                       proxyRes.headers['location'] = `${proxyPathPrefix}${suffix}`
                     }
@@ -527,8 +526,10 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                             suffix = url.slice(appPathBase.length)
                           } else if (url === appPathBase) {
                             suffix = '/'
-                          } else {
+                          } else if (isRootNamespace(url)) {
                             suffix = `${ROOT_ESCAPE}${url}`
+                          } else {
+                            suffix = url
                           }
                           return `${attr}${proxyPathPrefix}${suffix}`
                         },
