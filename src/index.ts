@@ -29,13 +29,43 @@ const PLUGIN_NAME = 'Embedded Webapp Proxy'
 const VALID_SCHEMES = new Set<string>(['http', 'https'])
 
 const HOST_PATTERN = /^[a-zA-Z0-9._-]+$/
-const CLOUD_METADATA_HOSTS = new Set(['169.254.169.254', 'metadata.google.internal'])
+// Hostnames that resolve to cloud-instance metadata services. Blocking these
+// at config-validation time prevents the most common SSRF target. DNS
+// rebinding (a configured hostname later resolving to one of these IPs) is
+// not addressed here — operators should restrict the plugin to trusted
+// internal apps as documented in the README.
+const CLOUD_METADATA_HOSTS = new Set([
+  '169.254.169.254', // AWS, GCP, OpenStack, DigitalOcean
+  'metadata.google.internal', // GCP
+  '100.100.100.200', // Alibaba Cloud
+  '192.0.0.192', // Oracle Cloud
+  '168.63.129.16', // Azure (wireserver)
+])
 
 // RFC 7230 §3.2.6 — characters valid in a header field name (HTTP token)
 const HTTP_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 
+// Hop-by-hop headers per RFC 7230 §6.1 — must not be forwarded across a proxy.
+// (Some, like 'connection' and 'transfer-encoding', are also handled by the
+// underlying proxy library; explicit removal here is defensive.)
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+])
+
 // Maximum number of apps accepted from configuration.
 const MAX_APP_SLOTS = 16
+
+// Cap the in-memory buffer used when injecting the path-rewrite script into
+// HTML responses.  Anything larger streams through unmodified to avoid OOM
+// from a misbehaving or hostile upstream.
+const MAX_HTML_REWRITE_BYTES = 10 * 1024 * 1024 // 10 MiB
 
 // Pattern for custom app path identifiers — must start with a letter so it
 // cannot be confused with a numeric index.
@@ -57,7 +87,121 @@ const ROOT_ESCAPE = '/__root__'
 const ROOT_NAMESPACES = ['/plugins/', '/signalk/', '/admin/', '/skServer/']
 
 function isRootNamespace(path: string): boolean {
+  // Never escape paths that already belong to this plugin — preserves routing
+  // between sibling apps configured on the same plugin instance.
+  if (path.startsWith(`${PLUGIN_PATH_PREFIX}/`) || path === PLUGIN_PATH_PREFIX) return false
   return ROOT_NAMESPACES.some((ns) => path.startsWith(ns))
+}
+
+// Compute the suffix that should follow proxyPathPrefix for a root-relative
+// URL — strips the app's base path, escapes SignalK root namespaces, and
+// passes everything else through unchanged. Centralises the logic shared by
+// Location, attribute, and Set-Cookie rewriting paths.
+function computeProxiedSuffix(url: string, appBasePath: string): string {
+  const base = appBasePath === '/' ? '' : appBasePath.replace(/\/$/, '')
+  // When the app has no base path, the main proxy already targets the host
+  // root, so there is nothing to escape — return the URL unchanged. This
+  // mirrors the client-side T() in buildRewriteScript, which also short-circuits
+  // on empty base. Emitting /__root__ here would route to pair.root, which is
+  // never created when path='/' (needsRoot is false), yielding a 404.
+  if (!base) return url
+  if (url.startsWith(base + '/')) return url.slice(base.length)
+  if (url === base) return '/'
+  if (isRootNamespace(url)) return `${ROOT_ESCAPE}${url}`
+  return url
+}
+
+// Rewrite the Path attribute of one or more Set-Cookie header values so the
+// browser sends the cookie back when requesting the proxied app.  Without
+// this, upstream cookies set with Path=/ (or Path=/api) would be stored
+// against the SignalK origin but with paths that never match the proxy URL
+// space, silently breaking session-based auth (e.g. Portainer login).
+//
+// Also strips Domain attributes — at this layer the cookie will be set on the
+// SignalK origin regardless, and a stale Domain pointing at the upstream host
+// would just cause the browser to drop the cookie.
+function rewriteSetCookie(
+  values: string[],
+  proxyPathPrefix: string,
+  appBasePath: string,
+): string[] {
+  return values.map((cookie) => {
+    const parts = cookie.split(';')
+    const out: string[] = []
+    for (const raw of parts) {
+      const part = raw.trim()
+      if (!part) continue
+      const eq = part.indexOf('=')
+      const name = (eq >= 0 ? part.slice(0, eq) : part).trim().toLowerCase()
+      if (name === 'domain') {
+        // Drop Domain — the cookie is being set at the SignalK origin.
+        continue
+      }
+      if (name === 'path') {
+        const value = eq >= 0 ? part.slice(eq + 1).trim() : ''
+        if (
+          value.charAt(0) === '/' &&
+          !value.startsWith(proxyPathPrefix + '/') &&
+          value !== proxyPathPrefix
+        ) {
+          const suffix = computeProxiedSuffix(value, appBasePath)
+          out.push(`Path=${proxyPathPrefix}${suffix}`)
+          continue
+        }
+      }
+      out.push(part)
+    }
+    return out.join('; ')
+  })
+}
+
+// Rewrite absolute-path values in src/href/action HTML attributes while
+// preserving the *bodies* of <script>, <style>, <textarea>, and HTML
+// comments verbatim — those can contain URL-attribute-shaped substrings
+// (string literals, CSS, escaped sample text) that must not be touched.
+// Opening-tag attributes (e.g. <script src="…">) are still rewritten.
+function rewriteHtmlAttributes(html: string, proxyPathPrefix: string, appBasePath: string): string {
+  const attrRe = /((?:src|href|action)=["'])(\/[^"']*)/gi
+  const replaceAttr = (_m: string, attr: string, url: string): string => {
+    if (url.startsWith('//')) return `${attr}${url}` // protocol-relative
+    if (url.startsWith(proxyPathPrefix)) return `${attr}${url}` // already proxied
+    return `${attr}${proxyPathPrefix}${computeProxiedSuffix(url, appBasePath)}`
+  }
+  // Match an HTML comment OR the opening tag of an element whose contents we
+  // must preserve verbatim.  Comments are kept as-is; opening tags are
+  // attribute-rewritten and their bodies passed through unchanged.
+  const boundaryRe = /<!--[\s\S]*?-->|<(script|style|textarea)\b[^>]*>/gi
+  let out = ''
+  let i = 0
+  let m: RegExpExecArray | null
+  while ((m = boundaryRe.exec(html)) !== null) {
+    out += html.slice(i, m.index).replace(attrRe, replaceAttr)
+    if (!m[1]) {
+      // Comment — append verbatim.
+      out += m[0]
+      i = m.index + m[0].length
+      boundaryRe.lastIndex = i
+      continue
+    }
+    // Opening <script>/<style>/<textarea> — rewrite its attributes, then skip
+    // until the matching closing tag.
+    out += m[0].replace(attrRe, replaceAttr)
+    const bodyStart = m.index + m[0].length
+    const closeRe = new RegExp(`</${m[1]}\\s*>`, 'i')
+    const closeMatch = closeRe.exec(html.slice(bodyStart))
+    if (!closeMatch) {
+      // No closing tag — keep the rest of the document verbatim.
+      out += html.slice(bodyStart)
+      i = html.length
+      break
+    }
+    const closeEnd = bodyStart + closeMatch.index + closeMatch[0].length
+    out += html.slice(bodyStart, closeEnd)
+    i = closeEnd
+    boundaryRe.lastIndex = closeEnd
+  }
+  out += html.slice(i).replace(attrRe, replaceAttr)
+  return out
 }
 
 function stripInvalidHeaders(req: IncomingMessage): void {
@@ -157,6 +301,10 @@ function parseAppConfig(raw: Record<string, unknown>, index: number): AppConfig 
       throw new Error(`appPath at index ${index} exceeds 64 characters`)
     }
   }
+  // Normalise to lowercase so the URL space is canonical — prevents two
+  // distinct cache/cookie scopes (/proxy/Portainer vs /proxy/portainer) for
+  // the same app while preserving the case-insensitive duplicate check below.
+  const appPath = rawAppPath.toLowerCase()
 
   const rewritePaths = typeof raw['rewritePaths'] === 'boolean' ? raw['rewritePaths'] : false
 
@@ -168,7 +316,7 @@ function parseAppConfig(raw: Record<string, unknown>, index: number): AppConfig 
     path,
     allowSelfSigned,
     timeout,
-    appPath: rawAppPath,
+    appPath,
     rewritePaths,
   }
 }
@@ -185,11 +333,11 @@ function parseConfig(config: object, onSkip: (index: number, err: unknown) => vo
     try {
       const appConfig = parseAppConfig(validObjects[i]!, i)
       if (appConfig.appPath.length > 0) {
-        const lower = appConfig.appPath.toLowerCase()
-        if (seenPaths.has(lower)) {
+        // appConfig.appPath is already lowercased by parseAppConfig.
+        if (seenPaths.has(appConfig.appPath)) {
           throw new Error(`Duplicate appPath "${appConfig.appPath}" at index ${i}`)
         }
-        seenPaths.add(lower)
+        seenPaths.add(appConfig.appPath)
       }
       results.push(appConfig)
     } catch (err) {
@@ -201,9 +349,13 @@ function parseConfig(config: object, onSkip: (index: number, err: unknown) => vo
 
 function resolveAppIndex(appId: string, apps: AppConfig[]): number {
   if (/^\d+$/.test(appId)) {
+    // Reject non-canonical numeric forms (e.g. "00", "01") so the URL space
+    // remains 1:1 with the app — distinct cache/cookie scopes for the same
+    // index are otherwise possible.
+    if (appId.length > 1 && appId.startsWith('0')) return -1
     return Number(appId)
   }
-  return apps.findIndex((a) => a.appPath.toLowerCase() === appId.toLowerCase())
+  return apps.findIndex((a) => a.appPath === appId.toLowerCase())
 }
 
 /**
@@ -218,11 +370,18 @@ function resolveAppIndex(appId: string, apps: AppConfig[]): number {
  * (e.g. "/grafana/d/..."), the normaliser strips that prefix before prepending
  * the proxy path prefix — preventing double-prefixing like "/proxy/grafana/grafana/d/...".
  */
+// Escape '<' so JSON-stringified literals embedded in an inline <script> tag
+// cannot break out via "</script>". URL pathnames and validated appPath values
+// never contain '<' in practice, but defensive escaping is cheap insurance.
+function jsLiteral(s: string): string {
+  return JSON.stringify(s).replace(/</g, '\\u003c')
+}
+
 function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): string {
-  const prefix = JSON.stringify(proxyPathPrefix)
+  const prefix = jsLiteral(proxyPathPrefix)
   // Normalise: strip trailing slash; "/" becomes "" (no stripping needed).
   const base = appBasePath === '/' ? '' : appBasePath.replace(/\/$/, '')
-  const baseJson = JSON.stringify(base)
+  const baseJson = jsLiteral(base)
   return (
     '<script data-signalk-embedded-webapp-proxy="path-rewrite">' +
     '(function(){' +
@@ -370,6 +529,28 @@ interface ProxyPair {
   root?: RequestHandler
 }
 
+// Pipe an upstream response through to the client untouched (apart from
+// stripping hop-by-hop headers).  Centralised so the body-rewriting and
+// fall-through paths share the same header-handling and error semantics.
+function streamThrough(proxyRes: IncomingMessage, res: ServerResponse, status: number): void {
+  const headers: Record<string, string | string[] | undefined> = { ...proxyRes.headers }
+  for (const h of HOP_BY_HOP_HEADERS) {
+    delete headers[h]
+  }
+  res.writeHead(status, headers)
+  proxyRes.on('error', () => {
+    // Upstream errored mid-stream.  Headers are already sent so the best we
+    // can do is destroy the connection so the client knows the body is
+    // truncated rather than receive a silently-incomplete payload.
+    try {
+      res.destroy()
+    } catch {
+      // already destroyed
+    }
+  })
+  proxyRes.pipe(res)
+}
+
 module.exports = function (app: ServerAPIWithServer): Plugin {
   let proxies: ProxyPair[] = []
   let currentApps: AppConfig[] = []
@@ -394,6 +575,12 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
 
       proxies = currentApps.map((appConfig, appIndex) => {
         const proxyPathPrefix = `${PLUGIN_PATH_PREFIX}${PROXY_SUBPATH}/${appConfig.appPath || String(appIndex)}`
+        // Compute the rewrite script once per app — its inputs are static for
+        // the life of the plugin instance, so re-building it on every HTML
+        // response is wasted work.
+        const rewriteScript = appConfig.rewritePaths
+          ? buildRewriteScript(proxyPathPrefix, appConfig.path)
+          : ''
         const makeProxy = (target: string, enableRewrite: boolean): RequestHandler =>
           createProxyMiddleware({
             target,
@@ -419,6 +606,15 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                   rawProto.split(',')[0]?.trim() ||
                   ((req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http')
                 proxyReq.setHeader('X-Forwarded-Proto', proto)
+                // Forward the original Host so upstream apps that build
+                // absolute URLs (share links, OAuth callbacks) can still
+                // reach this proxy.  changeOrigin: true rewrites the wire
+                // Host header to the target, so X-Forwarded-Host is the
+                // only way to communicate the original.
+                const incomingHost = req.headers['host']
+                if (typeof incomingHost === 'string' && incomingHost.length > 0) {
+                  proxyReq.setHeader('X-Forwarded-Host', incomingHost)
+                }
                 if (enableRewrite) {
                   // Constrain Accept-Encoding to encodings we can decompress for HTML
                   // script injection (br, gzip, deflate). Must honor what the *client*
@@ -466,29 +662,52 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                       loc.charAt(1) !== '/' &&
                       !loc.startsWith(proxyPathPrefix)
                     ) {
-                      const appPathBase =
-                        appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
-                      let suffix: string
-                      if (!appPathBase) {
-                        suffix = loc
-                      } else if (loc.startsWith(appPathBase + '/')) {
-                        suffix = loc.slice(appPathBase.length)
-                      } else if (loc === appPathBase) {
-                        suffix = '/'
-                      } else if (isRootNamespace(loc)) {
-                        suffix = `${ROOT_ESCAPE}${loc}`
-                      } else {
-                        suffix = loc
-                      }
-                      proxyRes.headers['location'] = `${proxyPathPrefix}${suffix}`
+                      proxyRes.headers['location'] =
+                        `${proxyPathPrefix}${computeProxiedSuffix(loc, appConfig.path)}`
                     }
                   }
 
+                  // Rewrite Set-Cookie Path attributes so cookies set by the
+                  // upstream app are scoped to the proxy URL space.  Without
+                  // this, cookies with Path=/ or Path=/api/ would be saved
+                  // against the SignalK origin but never sent back through
+                  // the proxy — silently breaking session-based auth.
+                  const sc = proxyRes.headers['set-cookie']
+                  if (sc && sc.length > 0) {
+                    proxyRes.headers['set-cookie'] = rewriteSetCookie(
+                      sc,
+                      proxyPathPrefix,
+                      appConfig.path,
+                    )
+                  }
+
+                  // Strip Content-Security-Policy headers so the injected
+                  // inline script is not blocked by a strict upstream CSP.
+                  // (The proxied app runs sandboxed inside an iframe at the
+                  // SignalK origin; the parent page's CSP still applies.)
+                  delete proxyRes.headers['content-security-policy']
+                  delete proxyRes.headers['content-security-policy-report-only']
+
                   if (ct.includes('text/html')) {
-                    // HTML: decompress if needed, inject path-rewriting script, then send.
                     const encoding = String(
                       proxyRes.headers['content-encoding'] ?? '',
                     ).toLowerCase()
+                    // Pick a decompression stream for known encodings; for
+                    // unknown non-empty encodings (e.g. zstd, compress) we
+                    // can't safely modify the body — fall through to a raw
+                    // pipe so the client receives the original bytes
+                    // intact, with the original Content-Encoding preserved.
+                    const knownEncoding =
+                      encoding === '' ||
+                      encoding === 'identity' ||
+                      encoding === 'gzip' ||
+                      encoding === 'x-gzip' ||
+                      encoding === 'deflate' ||
+                      encoding === 'br'
+                    if (!knownEncoding) {
+                      streamThrough(proxyRes, res, status)
+                      return
+                    }
                     const stream: NodeJS.ReadableStream =
                       encoding === 'gzip' || encoding === 'x-gzip'
                         ? proxyRes.pipe(createGunzip())
@@ -498,41 +717,53 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                             ? proxyRes.pipe(createBrotliDecompress())
                             : proxyRes
                     const chunks: Buffer[] = []
+                    let totalBytes = 0
+                    let aborted = false
+                    let pipedThrough = false
                     stream.on('data', (chunk: Buffer) => {
+                      if (aborted) return
+                      totalBytes += chunk.length
+                      if (totalBytes > MAX_HTML_REWRITE_BYTES) {
+                        // Body exceeded the rewrite cap.  Stop buffering and
+                        // forward the rest of the (original, still-encoded)
+                        // upstream stream untouched so the client at least
+                        // sees a valid response — even though it won't be
+                        // path-rewritten.
+                        aborted = true
+                        if (!pipedThrough) {
+                          pipedThrough = true
+                          // Discard any decompression pipeline we set up;
+                          // give the client the original bytes verbatim.
+                          streamThrough(proxyRes, res, status)
+                        }
+                        return
+                      }
                       chunks.push(chunk)
                     })
                     stream.on('end', () => {
+                      if (aborted) return
                       const html = Buffer.concat(chunks).toString('utf-8')
-                      const script = buildRewriteScript(proxyPathPrefix, appConfig.path)
-                      const injected = html.replace(/<head[^>]*>/i, (m) => m + script)
-                      // Rewrite absolute-path src/href/action attributes so static assets
-                      // and form actions route through the proxy instead of hitting the
-                      // host root.  Protocol-relative URLs (//…) are left untouched.
-                      // When the app has a configured base path (e.g. /grafana), strip it
-                      // from matching URLs before prepending the proxy prefix to prevent
-                      // double-prefixing (e.g. /grafana/d/... → /proxy/grafana/d/..., not
-                      // /proxy/grafana/grafana/d/...).
-                      const appPathBase =
-                        appConfig.path === '/' ? '' : appConfig.path.replace(/\/$/, '')
-                      const rewritten = injected.replace(
-                        /((?:src|href|action)=["'])(\/[^"']*)/gi,
-                        (match, attr: string, url: string) => {
-                          if (url.startsWith('//')) return match // protocol-relative
-                          if (url.startsWith(proxyPathPrefix)) return match // already proxied
-                          let suffix: string
-                          if (!appPathBase) {
-                            suffix = url
-                          } else if (url.startsWith(appPathBase + '/')) {
-                            suffix = url.slice(appPathBase.length)
-                          } else if (url === appPathBase) {
-                            suffix = '/'
-                          } else if (isRootNamespace(url)) {
-                            suffix = `${ROOT_ESCAPE}${url}`
-                          } else {
-                            suffix = url
-                          }
-                          return `${attr}${proxyPathPrefix}${suffix}`
-                        },
+                      // <head[\s/>] disambiguates from <header...> while
+                      // still matching <head>, <head class="...">, and the
+                      // self-closing <head/> form.
+                      const headRe = /<head(?=[\s/>])[^>]*>/i
+                      let injected: string
+                      if (headRe.test(html)) {
+                        injected = html.replace(headRe, (m) => m + rewriteScript)
+                      } else {
+                        // No <head> — fall back to injecting at the start of
+                        // <html> (for fragments) or at the document start.
+                        // This keeps the runtime XHR/fetch/WebSocket patches
+                        // active even when the upstream emits malformed HTML.
+                        const htmlRe = /<html\b[^>]*>/i
+                        injected = htmlRe.test(html)
+                          ? html.replace(htmlRe, (m) => m + rewriteScript)
+                          : rewriteScript + html
+                      }
+                      const rewritten = rewriteHtmlAttributes(
+                        injected,
+                        proxyPathPrefix,
+                        appConfig.path,
                       )
                       const buf = Buffer.from(rewritten, 'utf-8')
                       const headers = { ...proxyRes.headers }
@@ -543,21 +774,32 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                       res.end(buf)
                     })
                     stream.on('error', () => {
+                      if (aborted) return
                       if (!res.headersSent) {
                         res.writeHead(502, { 'Content-Type': 'text/plain' })
                       }
                       res.end('Bad Gateway: decompression error')
                     })
+                    // If the *source* stream errors after we've started
+                    // piping into a decoder, surface it to the same handler.
+                    proxyRes.on('error', () => {
+                      if (aborted || res.headersSent) return
+                      try {
+                        res.writeHead(502, { 'Content-Type': 'text/plain' })
+                      } catch {
+                        // headers already sent
+                      }
+                      try {
+                        res.end('Bad Gateway: upstream error')
+                      } catch {
+                        // already ended
+                      }
+                    })
                     return
                   }
                 }
 
-                // Stream response directly, preserving all original headers
-                // (including Content-Type).
-                const headers = { ...proxyRes.headers }
-                delete headers['transfer-encoding']
-                res.writeHead(status, headers)
-                proxyRes.pipe(res)
+                streamThrough(proxyRes, res, status)
               },
               error(err: Error, _req: IncomingMessage, res: ServerResponse | Socket): void {
                 app.error(`Web proxy error: ${err.message}`)

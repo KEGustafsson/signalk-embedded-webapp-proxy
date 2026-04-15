@@ -1912,5 +1912,347 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(script).toContain('childList:true')
       expect(script).toContain('attributeFilter:["href","src","action"]')
     })
+
+    it('injects after <head>, not after <header> when both are present', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      const { body } = await runHtmlProxyRes(
+        handler,
+        '<html><head><title>x</title></head><body><header class="hh">h</header></body></html>',
+      )
+      const out = body.toString()
+      const headIdx = out.indexOf('<head>')
+      const headerIdx = out.indexOf('<header')
+      const scriptIdx = out.indexOf('<script data-signalk-embedded-webapp-proxy=')
+      expect(scriptIdx).toBeGreaterThan(headIdx)
+      expect(scriptIdx).toBeLessThan(headerIdx)
+    })
+
+    it('injects script when HTML has no <head> tag (fragment fallback)', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      const { body } = await runHtmlProxyRes(
+        handler,
+        '<html><body><script src="/x.js"></script></body></html>',
+      )
+      const out = body.toString()
+      // Falls back to injecting just after <html>.
+      expect(out).toContain('<script data-signalk-embedded-webapp-proxy="path-rewrite">')
+      // Asset rewriting still applies.
+      expect(out).toContain('src="/plugins/signalk-embedded-webapp-proxy/proxy/0/x.js"')
+    })
+
+    it('passes unknown Content-Encoding responses through untouched', () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      Object.assign(proxyResStream, {
+        headers: { 'content-type': 'text/html', 'content-encoding': 'zstd' },
+        statusCode: 200,
+      })
+      const mockRes = {
+        writeHead: jest.fn(),
+        end: jest.fn(),
+        headersSent: false,
+        destroy: jest.fn(),
+        on: jest.fn(),
+        once: jest.fn(),
+        emit: jest.fn(),
+      }
+
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
+      // Headers should preserve content-encoding: we did NOT decompress, and
+      // we must not strip it (the client needs it to decode the body).
+      expect(mockRes.writeHead).toHaveBeenCalledWith(
+        200,
+        expect.objectContaining({ 'content-encoding': 'zstd' }),
+      )
+    })
+
+    // Build a res mock that can be piped into (required when the fall-through
+    // path is exercised via streamThrough → proxyRes.pipe(res)).
+    function makeWritableRes(): {
+      res: import('stream').PassThrough & { writeHead: jest.Mock; headersSent: boolean }
+      writeHead: jest.Mock
+    } {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const res = new PassThrough() as import('stream').PassThrough & {
+        writeHead: jest.Mock
+        headersSent: boolean
+      }
+      res.writeHead = jest.fn()
+      res.headersSent = false
+      return { res, writeHead: res.writeHead }
+    }
+
+    it('rewrites Set-Cookie Path attribute to be scoped to the proxy prefix', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      const headers: Record<string, string | string[]> = {
+        'content-type': 'application/json',
+        'set-cookie': [
+          'sess=abc; Path=/; HttpOnly',
+          'foo=bar; Domain=upstream.example.com; Path=/api; Secure',
+        ],
+      }
+      Object.assign(proxyResStream, { headers, statusCode: 200 })
+      const { res } = makeWritableRes()
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
+      proxyResStream.end()
+      await new Promise((r) => res.on('finish', r))
+
+      const cookies = headers['set-cookie'] as string[]
+      expect(cookies[0]).toContain('Path=/plugins/signalk-embedded-webapp-proxy/proxy/0/')
+      expect(cookies[0]).toContain('HttpOnly')
+      expect(cookies[1]).toContain('Path=/plugins/signalk-embedded-webapp-proxy/proxy/0/api')
+      // Domain attribute is dropped — cookie is set on the SignalK origin.
+      expect(cookies[1]).not.toMatch(/Domain=/i)
+    })
+
+    it('strips Content-Security-Policy headers when rewritePaths is enabled', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+        'content-security-policy': "default-src 'self'",
+        'content-security-policy-report-only': "default-src 'none'",
+      }
+      Object.assign(proxyResStream, { headers, statusCode: 200 })
+      const { res, writeHead } = makeWritableRes()
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
+      proxyResStream.end()
+      await new Promise((r) => res.on('finish', r))
+
+      const writeHeadCall = writeHead.mock.calls[0] as [number, Record<string, unknown>]
+      expect(writeHeadCall[1]).not.toHaveProperty('content-security-policy')
+      expect(writeHeadCall[1]).not.toHaveProperty('content-security-policy-report-only')
+    })
+
+    it('preserves Content-Security-Policy when rewritePaths is disabled', async () => {
+      plugin.start(oneApp(), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+        'content-security-policy': "default-src 'self'",
+      }
+      Object.assign(proxyResStream, { headers, statusCode: 200 })
+      const { res, writeHead } = makeWritableRes()
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
+      proxyResStream.end()
+      await new Promise((r) => res.on('finish', r))
+
+      expect(writeHead).toHaveBeenCalledWith(
+        200,
+        expect.objectContaining({ 'content-security-policy': "default-src 'self'" }),
+      )
+    })
+
+    it('strips hop-by-hop headers from upstream responses', async () => {
+      plugin.start(oneApp(), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+        connection: 'close',
+        'keep-alive': 'timeout=5',
+        'proxy-authenticate': 'Basic',
+        te: 'trailers',
+        trailer: 'X-Foo',
+        'transfer-encoding': 'chunked',
+        upgrade: 'h2c',
+      }
+      Object.assign(proxyResStream, { headers, statusCode: 200 })
+      const { res, writeHead } = makeWritableRes()
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
+      proxyResStream.end()
+      await new Promise((r) => res.on('finish', r))
+      const sent = (writeHead.mock.calls[0] as [number, Record<string, unknown>])[1]
+      for (const h of [
+        'connection',
+        'keep-alive',
+        'proxy-authenticate',
+        'te',
+        'trailer',
+        'transfer-encoding',
+        'upgrade',
+      ]) {
+        expect(sent).not.toHaveProperty(h)
+      }
+    })
+
+    it('does not rewrite asset URLs inside <script>, <style>, <textarea>, or comments', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      const html =
+        '<html><head>' +
+        '<style>body{background:url("/bg.png")}</style>' +
+        '</head><body>' +
+        '<script>var s = \'<a href="/should-not-rewrite">x</a>\';</script>' +
+        '<textarea>literal href="/raw"</textarea>' +
+        '<!-- href="/comment" -->' +
+        '<a href="/visible">v</a>' +
+        '</body></html>'
+      const { body } = await runHtmlProxyRes(handler, html)
+      const out = body.toString()
+      // Visible link IS rewritten.
+      expect(out).toContain('href="/plugins/signalk-embedded-webapp-proxy/proxy/0/visible"')
+      // Substrings inside skipped regions are NOT rewritten.
+      expect(out).toContain('var s = \'<a href="/should-not-rewrite">x</a>\';')
+      expect(out).toContain('<textarea>literal href="/raw"</textarea>')
+      expect(out).toContain('<!-- href="/comment" -->')
+      expect(out).toContain('<style>body{background:url("/bg.png")}</style>')
+    })
+
+    it('still rewrites the opening-tag attributes of <script>/<style> elements', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      const html =
+        '<html><head><script src="/lib.js"></script>' +
+        '<link href="/styles.css"></head><body></body></html>'
+      const { body } = await runHtmlProxyRes(handler, html)
+      const out = body.toString()
+      expect(out).toContain('src="/plugins/signalk-embedded-webapp-proxy/proxy/0/lib.js"')
+      expect(out).toContain('href="/plugins/signalk-embedded-webapp-proxy/proxy/0/styles.css"')
+    })
+
+    it('does not root-escape Location headers pointing to a sibling proxied app', () => {
+      plugin.start(
+        {
+          apps: [
+            {
+              name: 'A',
+              url: 'http://localhost:9000/grafana',
+              appPath: 'grafana',
+              rewritePaths: true,
+            },
+          ],
+        },
+        jest.fn(),
+      )
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      const headers: Record<string, string> = {
+        'content-type': 'text/html',
+        // Sibling app under the same plugin — must NOT get __root__ escape.
+        location: '/plugins/signalk-embedded-webapp-proxy/proxy/other/page',
+      }
+      Object.assign(proxyResStream, { headers, statusCode: 302 })
+      const mockRes = {
+        writeHead: jest.fn(),
+        end: jest.fn(),
+        headersSent: false,
+        on: jest.fn(),
+        destroy: jest.fn(),
+      }
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
+      expect(headers['location']).not.toContain('__root__')
+    })
+
+    it('forwards X-Forwarded-Host from the incoming Host header', () => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+      plugin.start(oneApp(), jest.fn())
+      const proxyReqHandler = extractProxyReqHandler()
+
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqHandler(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.1' },
+        headers: { host: 'sk.example.com:3000' },
+      })
+      const calls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      const headerMap = Object.fromEntries(calls.map(([k, v]) => [k, v]))
+      expect(headerMap['X-Forwarded-Host']).toBe('sk.example.com:3000')
+    })
+  })
+
+  describe('appId resolution edge cases', () => {
+    let mockRouter: IRouter
+    let registeredHandlers: Map<string, MiddlewareFn>
+    beforeEach(() => {
+      registeredHandlers = new Map()
+      mockRouter = {
+        use: jest.fn((path: string, handler: MiddlewareFn) => {
+          registeredHandlers.set(path, handler)
+          return mockRouter
+        }),
+        get: jest.fn(() => mockRouter),
+      } as unknown as IRouter
+    })
+
+    it('returns 404 for non-canonical numeric appId (leading zero)', () => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+      plugin.start(oneApp(), jest.fn())
+      plugin.registerWithRouter!(mockRouter)
+      const handler = registeredHandlers.get('/proxy/:appId')!
+
+      const mockReq = { params: { appId: '00' } } as unknown as Request
+      const mockRes = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn().mockReturnThis(),
+      } as unknown as Response
+      handler(mockReq, mockRes, jest.fn())
+      expect(mockRes.status).toHaveBeenCalledWith(404)
+    })
+
+    it('blocks Azure cloud metadata host', () => {
+      plugin.start({ apps: [{ name: 'X', url: 'http://168.63.129.16/' }] }, jest.fn())
+      expect(mockCreateProxyMiddleware).not.toHaveBeenCalled()
+    })
+
+    it('blocks Alibaba cloud metadata host', () => {
+      plugin.start({ apps: [{ name: 'X', url: 'http://100.100.100.200/' }] }, jest.fn())
+      expect(mockCreateProxyMiddleware).not.toHaveBeenCalled()
+    })
+
+    it('blocks Oracle cloud metadata host', () => {
+      plugin.start({ apps: [{ name: 'X', url: 'http://192.0.0.192/' }] }, jest.fn())
+      expect(mockCreateProxyMiddleware).not.toHaveBeenCalled()
+    })
+
+    it('normalises configured appPath to lowercase in /apps response', () => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+      plugin.start(
+        { apps: [{ name: 'P', url: 'http://localhost:9000', appPath: 'Portainer' }] },
+        jest.fn(),
+      )
+      const getHandlers = new Map<string, (req: Request, res: Response) => void>()
+      const router = {
+        use: jest.fn(() => router),
+        get: jest.fn((p: string, h: (req: Request, res: Response) => void) => {
+          getHandlers.set(p, h)
+          return router
+        }),
+      } as unknown as IRouter
+      plugin.registerWithRouter!(router)
+      const h = getHandlers.get('/apps')!
+      const mockRes = { json: jest.fn() } as unknown as Response
+      h({} as Request, mockRes)
+      expect(mockRes.json).toHaveBeenCalledWith([{ index: 0, name: 'P', appPath: 'portainer' }])
+    })
   })
 })
