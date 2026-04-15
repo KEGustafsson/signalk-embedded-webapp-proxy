@@ -99,7 +99,12 @@ function isRootNamespace(path: string): boolean {
 // Location, attribute, and Set-Cookie rewriting paths.
 function computeProxiedSuffix(url: string, appBasePath: string): string {
   const base = appBasePath === '/' ? '' : appBasePath.replace(/\/$/, '')
-  if (!base) return isRootNamespace(url) ? `${ROOT_ESCAPE}${url}` : url
+  // When the app has no base path, the main proxy already targets the host
+  // root, so there is nothing to escape — return the URL unchanged. This
+  // mirrors the client-side T() in buildRewriteScript, which also short-circuits
+  // on empty base. Emitting /__root__ here would route to pair.root, which is
+  // never created when path='/' (needsRoot is false), yielding a 404.
+  if (!base) return url
   if (url.startsWith(base + '/')) return url.slice(base.length)
   if (url === base) return '/'
   if (isRootNamespace(url)) return `${ROOT_ESCAPE}${url}`
@@ -115,7 +120,11 @@ function computeProxiedSuffix(url: string, appBasePath: string): string {
 // Also strips Domain attributes — at this layer the cookie will be set on the
 // SignalK origin regardless, and a stale Domain pointing at the upstream host
 // would just cause the browser to drop the cookie.
-function rewriteSetCookie(values: string[], proxyPathPrefix: string, appBasePath: string): string[] {
+function rewriteSetCookie(
+  values: string[],
+  proxyPathPrefix: string,
+  appBasePath: string,
+): string[] {
   return values.map((cookie) => {
     const parts = cookie.split(';')
     const out: string[] = []
@@ -130,7 +139,11 @@ function rewriteSetCookie(values: string[], proxyPathPrefix: string, appBasePath
       }
       if (name === 'path') {
         const value = eq >= 0 ? part.slice(eq + 1).trim() : ''
-        if (value.charAt(0) === '/' && !value.startsWith(proxyPathPrefix + '/') && value !== proxyPathPrefix) {
+        if (
+          value.charAt(0) === '/' &&
+          !value.startsWith(proxyPathPrefix + '/') &&
+          value !== proxyPathPrefix
+        ) {
           const suffix = computeProxiedSuffix(value, appBasePath)
           out.push(`Path=${proxyPathPrefix}${suffix}`)
           continue
@@ -147,11 +160,7 @@ function rewriteSetCookie(values: string[], proxyPathPrefix: string, appBasePath
 // comments verbatim — those can contain URL-attribute-shaped substrings
 // (string literals, CSS, escaped sample text) that must not be touched.
 // Opening-tag attributes (e.g. <script src="…">) are still rewritten.
-function rewriteHtmlAttributes(
-  html: string,
-  proxyPathPrefix: string,
-  appBasePath: string,
-): string {
+function rewriteHtmlAttributes(html: string, proxyPathPrefix: string, appBasePath: string): string {
   const attrRe = /((?:src|href|action)=["'])(\/[^"']*)/gi
   const replaceAttr = (_m: string, attr: string, url: string): string => {
     if (url.startsWith('//')) return `${attr}${url}` // protocol-relative
@@ -523,11 +532,7 @@ interface ProxyPair {
 // Pipe an upstream response through to the client untouched (apart from
 // stripping hop-by-hop headers).  Centralised so the body-rewriting and
 // fall-through paths share the same header-handling and error semantics.
-function streamThrough(
-  proxyRes: IncomingMessage,
-  res: ServerResponse,
-  status: number,
-): void {
+function streamThrough(proxyRes: IncomingMessage, res: ServerResponse, status: number): void {
   const headers: Record<string, string | string[] | undefined> = { ...proxyRes.headers }
   for (const h of HOP_BY_HOP_HEADERS) {
     delete headers[h]
