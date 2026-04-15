@@ -213,8 +213,8 @@ The application's frontend is making API calls with absolute paths that bypass t
 ### Setup
 
 ```bash
-git clone https://github.com/KEGustafsson/signalk-portainer.git
-cd signalk-portainer
+git clone https://github.com/KEGustafsson/signalk-embedded-webapp-proxy.git
+cd signalk-embedded-webapp-proxy
 npm install
 ```
 
@@ -247,7 +247,7 @@ npm run format:check   # Check formatting
 ```bash
 npm run build
 cd ~/.signalk
-npm link /path/to/signalk-portainer
+npm link /path/to/signalk-embedded-webapp-proxy
 ```
 
 Then restart SignalK server. Changes to the plugin source require rebuilding and restarting.

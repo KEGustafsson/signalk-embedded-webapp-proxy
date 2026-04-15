@@ -26,6 +26,7 @@ const AppPanel: React.FC = () => {
   const [apps, setApps] = React.useState<AppInfo[]>([])
   const [selected, setSelected] = React.useState<number | null>(null)
   const [loading, setLoading] = React.useState(true)
+  const [loadError, setLoadError] = React.useState(false)
   const [barVisible, setBarVisible] = React.useState(true)
   const hideTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -41,6 +42,11 @@ const AppPanel: React.FC = () => {
     hideTimer.current = setTimeout(() => setBarVisible(false), AUTO_HIDE_DELAY)
   }, [clearHideTimer])
 
+  const revealToolbar = React.useCallback(() => {
+    clearHideTimer()
+    setBarVisible(true)
+  }, [clearHideTimer])
+
   // Clean up timer on unmount
   React.useEffect(() => clearHideTimer, [clearHideTimer])
 
@@ -52,7 +58,10 @@ const AppPanel: React.FC = () => {
   }, [selected, scheduleHide])
 
   React.useEffect(() => {
-    fetch(`${PLUGIN_PATH}/apps`)
+    // AbortController so an in-flight fetch from a previous mount/render does
+    // not call setState after unmount.
+    const controller = new AbortController()
+    fetch(`${PLUGIN_PATH}/apps`, { signal: controller.signal })
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${String(r.status)}`)
         return r.json() as Promise<AppInfo[]>
@@ -62,14 +71,26 @@ const AppPanel: React.FC = () => {
         // Auto-select the only app so the iframe loads immediately
         if (data.length === 1) setSelected(data[0]?.index ?? 0)
       })
-      .catch(() => {
-        // Leave apps empty — the empty-state message will be shown
+      .catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return
+        // Distinguish from "no apps configured" so the user sees a real signal.
+        setLoadError(true)
       })
       .finally(() => setLoading(false))
+    return () => controller.abort()
   }, [])
 
   if (loading) {
     return <div style={msgStyle}>Loading…</div>
+  }
+
+  if (loadError) {
+    return (
+      <div style={msgStyle} role="alert">
+        Unable to load the application list. Check that the SignalK plugin is enabled and reachable,
+        then reload this page.
+      </div>
+    )
   }
 
   if (apps.length === 0) {
@@ -95,7 +116,9 @@ const AppPanel: React.FC = () => {
     >
       {showToolbar && (
         <>
-          {/* Invisible hot zone at top — reveals toolbar on hover */}
+          {/* Invisible hot zone at top — reveals toolbar on hover/focus.
+              Keyboard users tabbing into the panel also reveal it via the
+              focusin handler on the wrapper below. */}
           {!barVisible && (
             <div
               data-testid="hot-zone"
@@ -108,15 +131,16 @@ const AppPanel: React.FC = () => {
                 zIndex: 20,
                 cursor: 'default',
               }}
-              onMouseEnter={() => {
-                clearHideTimer()
-                setBarVisible(true)
-              }}
+              onMouseEnter={revealToolbar}
+              aria-hidden="true"
             />
           )}
           {/* Sliding toolbar */}
           <div
             data-testid="toolbar"
+            role="toolbar"
+            aria-label="Embedded webapp controls"
+            aria-hidden={barVisible ? undefined : 'true'}
             style={{
               position: 'absolute',
               top: barVisible ? 0 : -TOOLBAR_HEIGHT,
@@ -133,11 +157,15 @@ const AppPanel: React.FC = () => {
             }}
             onMouseEnter={clearHideTimer}
             onMouseLeave={scheduleHide}
+            onFocus={revealToolbar}
+            onBlur={scheduleHide}
           >
             <select
               value={selected ?? ''}
               onChange={(e) => setSelected(Number(e.target.value))}
               aria-label="Select application"
+              // Disable when hidden so it isn't a tab stop in collapsed state.
+              tabIndex={barVisible ? 0 : -1}
             >
               <option value="" disabled>
                 Select an application…

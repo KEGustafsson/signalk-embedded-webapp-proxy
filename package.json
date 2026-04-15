@@ -37,8 +37,12 @@
     "url": "https://github.com/KEGustafsson/signalk-embedded-webapp-proxy/issues"
   },
   "homepage": "https://github.com/KEGustafsson/signalk-embedded-webapp-proxy#readme",
+  "files": [
+    "dist",
+    "public"
+  ],
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "dependencies": {
     "http-proxy-middleware": "^3.0.3"

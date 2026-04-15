@@ -49,16 +49,16 @@ describe('AppPanel', () => {
       expect(await screen.findByText(/No web applications configured/i)).toBeInTheDocument()
     })
 
-    it('shows configure message when fetch fails', async () => {
+    it('shows error message when fetch fails', async () => {
       mockFetchError()
       render(<AppPanel />)
-      expect(await screen.findByText(/No web applications configured/i)).toBeInTheDocument()
+      expect(await screen.findByText(/Unable to load the application list/i)).toBeInTheDocument()
     })
 
-    it('shows configure message when server returns non-2xx', async () => {
+    it('shows error message when server returns non-2xx', async () => {
       mockFetchHttpError(500)
       render(<AppPanel />)
-      expect(await screen.findByText(/No web applications configured/i)).toBeInTheDocument()
+      expect(await screen.findByText(/Unable to load the application list/i)).toBeInTheDocument()
     })
   })
 
@@ -354,7 +354,10 @@ describe('AppPanel', () => {
       mockFetchApps([])
       render(<AppPanel />)
       await screen.findByText(/No web applications configured/i)
-      expect(global.fetch).toHaveBeenCalledWith('/plugins/signalk-embedded-webapp-proxy/apps')
+      expect(global.fetch).toHaveBeenCalledWith(
+        '/plugins/signalk-embedded-webapp-proxy/apps',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
     })
   })
 })
