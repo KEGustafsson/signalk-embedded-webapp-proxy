@@ -1,6 +1,6 @@
 import type { Plugin, ServerAPI } from '@signalk/server-api'
 import type { IRouter, Request, Response } from 'express'
-import type { IncomingMessage, Server, ServerResponse } from 'http'
+import type { ClientRequest, IncomingMessage, Server, ServerResponse } from 'http'
 import { Socket } from 'net'
 import { createBrotliDecompress, createGunzip, createInflate } from 'zlib'
 import { createProxyMiddleware, fixRequestBody, type RequestHandler } from 'http-proxy-middleware'
@@ -237,6 +237,80 @@ function buildRootTarget(appConfig: AppConfig): string {
   return `${appConfig.scheme}://${appConfig.host}:${String(appConfig.port)}`
 }
 
+// Build the http(s)://host[:port] string that matches what `changeOrigin:true`
+// writes into the outgoing Host header (see http-proxy common.js setupOutgoing).
+// When the port is the scheme default (80/443), http-proxy omits it from Host;
+// mirror that here so Origin and Host stay in sync on strict upstreams.
+function computeTargetOrigin(appConfig: AppConfig): string {
+  const isDefaultPort =
+    (appConfig.scheme === 'http' && appConfig.port === 80) ||
+    (appConfig.scheme === 'https' && appConfig.port === 443)
+  const hostPort = isDefaultPort ? appConfig.host : `${appConfig.host}:${String(appConfig.port)}`
+  return `${appConfig.scheme}://${hostPort}`
+}
+
+// Apply X-Real-IP / X-Forwarded-* to an outgoing proxied request. Shared between
+// HTTP (`proxyReq`) and WebSocket upgrade (`proxyReqWs`) hooks — the only
+// difference is the default protocol label ("http"/"https" vs "ws"/"wss").
+// If the incoming request already carries X-Forwarded-Proto (we're behind
+// another reverse proxy), its first value wins so the full chain is preserved.
+function applyForwardedHeaders(
+  proxyReq: ClientRequest,
+  req: IncomingMessage,
+  defaultProto: string,
+): void {
+  const remoteAddress = req.socket?.remoteAddress ?? ''
+  proxyReq.setHeader('X-Real-IP', remoteAddress)
+  const existing = req.headers['x-forwarded-for']
+  const forwarded = existing ? `${String(existing)}, ${remoteAddress}` : remoteAddress
+  proxyReq.setHeader('X-Forwarded-For', forwarded)
+  const incomingProto = req.headers['x-forwarded-proto']
+  const rawProto = typeof incomingProto === 'string' ? incomingProto : (incomingProto?.[0] ?? '')
+  const proto = rawProto.split(',')[0]?.trim() || defaultProto
+  proxyReq.setHeader('X-Forwarded-Proto', proto)
+  // Forward the original Host so upstream apps that build absolute URLs (share
+  // links, OAuth callbacks) can still reach this proxy. changeOrigin: true
+  // rewrites the wire Host header to the target, so X-Forwarded-Host is the
+  // only way to communicate the original.
+  const incomingHost = req.headers['host']
+  if (typeof incomingHost === 'string' && incomingHost.length > 0) {
+    proxyReq.setHeader('X-Forwarded-Host', incomingHost)
+  }
+}
+
+// Rewrite the outgoing Origin header so upstream apps that enforce same-origin
+// WebSocket / CORS policy see a value matching the target host (which
+// changeOrigin:true has already rewritten into the Host header). The original
+// Host is preserved in X-Forwarded-Host via applyForwardedHeaders, so apps
+// that need it can still recover it. Leaves Origin untouched when the
+// incoming request has no Origin header (non-browser clients).
+//
+// SECURITY TRADEOFF: This rewrites Origin unconditionally — mirroring the
+// canonical reverse-proxy recipe for apps like Portainer and Grafana
+// (`proxy_set_header Origin $host;` in nginx). That means if an upstream app
+// uses cookie-based auth *and* relies on Origin for CSRF protection *and*
+// sets its cookies with SameSite=None, a cross-site credentialed request
+// would have its Origin forged into a same-site one. In practice this vector
+// is narrow: modern browsers default cookies to SameSite=Lax (blocking
+// cross-site credentialed POSTs outright), Portainer uses JWT-in-header
+// rather than cookies, and this plugin is documented for trusted-network
+// deployments. We prefer compatibility with real apps over defense against
+// this specific layered failure. A conditional rewrite (0.3.2) broke
+// Portainer deletes in the field; unconditional rewrite is the pragmatic
+// choice.
+function rewriteOriginHeader(
+  proxyReq: ClientRequest,
+  req: IncomingMessage,
+  targetOrigin: string,
+): void {
+  const incoming = req.headers['origin']
+  const origin =
+    typeof incoming === 'string' ? incoming : Array.isArray(incoming) ? (incoming[0] ?? '') : ''
+  if (origin.length > 0) {
+    proxyReq.setHeader('Origin', targetOrigin)
+  }
+}
+
 function parseAppConfig(raw: Record<string, unknown>, index: number): AppConfig {
   const rawUrl = typeof raw['url'] === 'string' ? raw['url'].trim() : ''
   if (rawUrl.length === 0) {
@@ -429,16 +503,20 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     // Apps often build WS URLs as full strings (ws://<location.host>/path) before
     // calling new WebSocket(), so we also match full ws(s):// URLs whose host
     // matches the current page host and rewrite them through the proxy.
+    // URL objects (new WebSocket(new URL(...))) are coerced to strings so the
+    // same rewrite applies — without this, apps like Portainer that build WS
+    // URLs via the URL constructor would bypass the proxy.
     'var W=window.WebSocket;if(W){' +
     'window.WebSocket=function(u,p){' +
     'var l=window.location;' +
-    'if(typeof u==="string"){' +
-    'var m=u.match(/^wss?:\\/\\/([^/?#]+)([/?#].*)?$/);' +
+    'var us=(typeof u==="string")?u:(u&&typeof u.href==="string")?String(u):null;' +
+    'if(us!==null){' +
+    'var m=us.match(/^wss?:\\/\\/([^/?#]+)([/?#].*)?$/);' +
     'if(m&&m[1]===l.host){var pt=m[2]||"/";' +
     'if(pt.charAt(0)==="/"&&pt.indexOf(P)!==0)' +
     "u=(l.protocol==='https:'?'wss:':'ws:')+'//'+l.host+P+T(pt)}" +
-    'else if(R(u))' +
-    "u=(l.protocol==='https:'?'wss:':'ws:')+'//'+l.host+P+T(u)}" +
+    'else if(R(us))' +
+    "u=(l.protocol==='https:'?'wss:':'ws:')+'//'+l.host+P+T(us)}" +
     'return p!==undefined?new W(u,p):new W(u)};' +
     'window.WebSocket.prototype=W.prototype;' +
     'window.WebSocket.CONNECTING=W.CONNECTING;' +
@@ -581,6 +659,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
         const rewriteScript = appConfig.rewritePaths
           ? buildRewriteScript(proxyPathPrefix, appConfig.path)
           : ''
+        const targetOrigin = computeTargetOrigin(appConfig)
         const makeProxy = (target: string, enableRewrite: boolean): RequestHandler =>
           createProxyMiddleware({
             target,
@@ -594,27 +673,16 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
             selfHandleResponse: true,
             on: {
               proxyReq(proxyReq, req): void {
-                const remoteAddress = req.socket?.remoteAddress ?? ''
-                proxyReq.setHeader('X-Real-IP', remoteAddress)
-                const existing = req.headers['x-forwarded-for']
-                const forwarded = existing ? `${String(existing)}, ${remoteAddress}` : remoteAddress
-                proxyReq.setHeader('X-Forwarded-For', forwarded)
-                const incomingProto = req.headers['x-forwarded-proto']
-                const rawProto =
-                  typeof incomingProto === 'string' ? incomingProto : (incomingProto?.[0] ?? '')
-                const proto =
-                  rawProto.split(',')[0]?.trim() ||
-                  ((req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http')
-                proxyReq.setHeader('X-Forwarded-Proto', proto)
-                // Forward the original Host so upstream apps that build
-                // absolute URLs (share links, OAuth callbacks) can still
-                // reach this proxy.  changeOrigin: true rewrites the wire
-                // Host header to the target, so X-Forwarded-Host is the
-                // only way to communicate the original.
-                const incomingHost = req.headers['host']
-                if (typeof incomingHost === 'string' && incomingHost.length > 0) {
-                  proxyReq.setHeader('X-Forwarded-Host', incomingHost)
-                }
+                const defaultProto = (req.socket as { encrypted?: boolean }).encrypted
+                  ? 'https'
+                  : 'http'
+                applyForwardedHeaders(proxyReq, req, defaultProto)
+                // Realign Origin with the upstream Host that changeOrigin
+                // wrote. Apps that enforce same-origin WebSocket/CORS policy
+                // (and CSRF-preflight checks) reject cross-origin POSTs when
+                // Origin doesn't match. The original value is retained in
+                // X-Forwarded-Host for apps that need to recover it.
+                rewriteOriginHeader(proxyReq, req, targetOrigin)
                 if (enableRewrite) {
                   // Constrain Accept-Encoding to encodings we can decompress for HTML
                   // script injection (br, gzip, deflate). Must honor what the *client*
@@ -641,6 +709,21 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                 // calls — fixRequestBody writes to the proxy request which
                 // locks headers; calling setHeader afterwards throws ERR_HTTP_HEADERS_SENT.
                 fixRequestBody(proxyReq, req)
+              },
+              // WebSocket upgrade hook — fires just before http-proxy sends
+              // the GET … HTTP/1.1 upgrade request to the target. Mirrors the
+              // header rewriting the HTTP proxyReq hook does so WS upgrades
+              // carry the same X-Forwarded-* metadata and realigned Origin
+              // (critical for apps like Portainer's container exec: without
+              // these, strict upstreams silently drop the connection). No
+              // fixRequestBody / Accept-Encoding — upgrades have no body and
+              // no Content-Encoding to negotiate.
+              proxyReqWs(proxyReq, req): void {
+                const defaultProto = (req.socket as { encrypted?: boolean }).encrypted
+                  ? 'wss'
+                  : 'ws'
+                applyForwardedHeaders(proxyReq, req, defaultProto)
+                rewriteOriginHeader(proxyReq, req, targetOrigin)
               },
               proxyRes(
                 proxyRes: IncomingMessage,
