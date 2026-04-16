@@ -1,6 +1,6 @@
 {
   "name": "signalk-embedded-webapp-proxy",
-  "version": "0.3.4",
+  "version": "0.4.0",
   "description": "Signal K embedded webapp plugin — Run any local web application as an embedded Webapp",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
