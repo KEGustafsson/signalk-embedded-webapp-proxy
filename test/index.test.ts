@@ -43,6 +43,12 @@ function extractProxyReqHandler(): ProxyReqFn {
   return (options['on'] as Record<string, unknown>)['proxyReq'] as ProxyReqFn
 }
 
+/** Extracts the proxyReqWs (WebSocket upgrade) handler from the first createProxyMiddleware call. */
+function extractProxyReqWsHandler(): ProxyReqFn {
+  const options = (mockCreateProxyMiddleware.mock.calls[0] as [Record<string, unknown>])[0]
+  return (options['on'] as Record<string, unknown>)['proxyReqWs'] as ProxyReqFn
+}
+
 describe('signalk-embedded-webapp-proxy plugin', () => {
   let plugin: Plugin
 
@@ -418,6 +424,65 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
       const headerMap = Object.fromEntries(setCalls.map(([k, v]) => [k, v]))
       expect(headerMap['X-Forwarded-Proto']).toBe('https')
+    })
+
+    it('rewrites Origin header on HTTP proxyReq to the target origin', () => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+
+      plugin.start(oneApp({ url: 'https://127.0.0.1:9443' }), jest.fn())
+
+      const proxyReqHandler = extractProxyReqHandler()
+
+      const mockProxyReq = { setHeader: jest.fn() }
+      const mockReq = {
+        socket: { remoteAddress: '10.0.0.5', encrypted: true },
+        headers: { origin: 'https://signalk.local:3443', host: 'signalk.local:3443' },
+      }
+
+      proxyReqHandler(mockProxyReq, mockReq)
+
+      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      const headerMap = Object.fromEntries(setCalls.map(([k, v]) => [k, v]))
+      expect(headerMap['Origin']).toBe('https://127.0.0.1:9443')
+      // The original host must still be recoverable via X-Forwarded-Host.
+      expect(headerMap['X-Forwarded-Host']).toBe('signalk.local:3443')
+    })
+
+    it('omits port in target Origin when target uses default scheme port', () => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+
+      plugin.start(oneApp({ url: 'https://upstream.example.com' }), jest.fn())
+
+      const proxyReqHandler = extractProxyReqHandler()
+
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqHandler(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.6', encrypted: true },
+        headers: { origin: 'https://signalk.local:3443', host: 'signalk.local:3443' },
+      })
+
+      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      const headerMap = Object.fromEntries(setCalls.map(([k, v]) => [k, v]))
+      // Port 443 is the default for https — must be omitted so Origin matches
+      // the Host header that changeOrigin: true writes (no default-port suffix).
+      expect(headerMap['Origin']).toBe('https://upstream.example.com')
+    })
+
+    it('does not set Origin on HTTP proxyReq when request has no Origin header', () => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+
+      plugin.start(oneApp({ url: 'https://127.0.0.1:9443' }), jest.fn())
+
+      const proxyReqHandler = extractProxyReqHandler()
+
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqHandler(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.7', encrypted: true },
+        headers: {},
+      })
+
+      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      expect(setCalls.find(([k]) => k === 'Origin')).toBeUndefined()
     })
 
     it('ignores allowSelfSigned when scheme is http', () => {
@@ -878,6 +943,105 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       handler(mockReq, mockRes, mockNext)
 
       expect(mockRes.status).toHaveBeenCalledWith(503)
+    })
+  })
+
+  describe('WebSocket upgrade header rewriting (proxyReqWs)', () => {
+    beforeEach(() => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+    })
+
+    it('registers a proxyReqWs hook on every proxy', () => {
+      plugin.start(oneApp(), jest.fn())
+
+      const options = (mockCreateProxyMiddleware.mock.calls[0] as [Record<string, unknown>])[0]
+      const on = options['on'] as Record<string, unknown>
+      expect(typeof on['proxyReqWs']).toBe('function')
+    })
+
+    it('applies X-Forwarded-* headers with ws/wss protocol on upgrade', () => {
+      plugin.start(oneApp(), jest.fn())
+
+      const proxyReqWs = extractProxyReqWsHandler()
+      const mockProxyReq = { setHeader: jest.fn() }
+      const mockReq = {
+        socket: { remoteAddress: '10.0.0.8', encrypted: false },
+        headers: { host: 'signalk.local:3000' },
+      }
+
+      proxyReqWs(mockProxyReq, mockReq)
+
+      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      const headerMap = Object.fromEntries(setCalls.map(([k, v]) => [k, v]))
+      expect(headerMap['X-Real-IP']).toBe('10.0.0.8')
+      expect(headerMap['X-Forwarded-For']).toBe('10.0.0.8')
+      // RFC 7239 / http-proxy's built-in xfwd pass uses ws/wss for upgrades.
+      expect(headerMap['X-Forwarded-Proto']).toBe('ws')
+      expect(headerMap['X-Forwarded-Host']).toBe('signalk.local:3000')
+    })
+
+    it('uses wss when the incoming socket is TLS-encrypted', () => {
+      plugin.start(oneApp(), jest.fn())
+
+      const proxyReqWs = extractProxyReqWsHandler()
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqWs(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.9', encrypted: true },
+        headers: { host: 'signalk.local:3443' },
+      })
+
+      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      const headerMap = Object.fromEntries(setCalls.map(([k, v]) => [k, v]))
+      expect(headerMap['X-Forwarded-Proto']).toBe('wss')
+    })
+
+    it('rewrites Origin to the target origin when the request carries Origin', () => {
+      plugin.start(oneApp({ url: 'https://127.0.0.1:9443' }), jest.fn())
+
+      const proxyReqWs = extractProxyReqWsHandler()
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqWs(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.10', encrypted: true },
+        headers: {
+          host: 'signalk.local:3443',
+          origin: 'https://signalk.local:3443',
+        },
+      })
+
+      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      const headerMap = Object.fromEntries(setCalls.map(([k, v]) => [k, v]))
+      // Target Host = 127.0.0.1:9443 (non-default https port), so Origin must match.
+      expect(headerMap['Origin']).toBe('https://127.0.0.1:9443')
+      expect(headerMap['X-Forwarded-Host']).toBe('signalk.local:3443')
+    })
+
+    it('leaves Origin untouched on upgrade when request has no Origin header', () => {
+      plugin.start(oneApp({ url: 'https://127.0.0.1:9443' }), jest.fn())
+
+      const proxyReqWs = extractProxyReqWsHandler()
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqWs(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.11', encrypted: true },
+        headers: { host: 'signalk.local:3443' },
+      })
+
+      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      expect(setCalls.find(([k]) => k === 'Origin')).toBeUndefined()
+    })
+
+    it('appends the client IP to an existing X-Forwarded-For on upgrade', () => {
+      plugin.start(oneApp(), jest.fn())
+
+      const proxyReqWs = extractProxyReqWsHandler()
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqWs(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.12' },
+        headers: { 'x-forwarded-for': '192.168.1.1' },
+      })
+
+      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
+      const headerMap = Object.fromEntries(setCalls.map(([k, v]) => [k, v]))
+      expect(headerMap['X-Forwarded-For']).toBe('192.168.1.1, 10.0.0.12')
     })
   })
 
@@ -1424,11 +1588,20 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       vm.createContext(sandbox)
       vm.runInContext(scriptBody, sandbox)
 
-      const W = (sandbox.window as { WebSocket: new (u: string) => unknown }).WebSocket
+      const W = (sandbox.window as { WebSocket: new (u: unknown) => unknown }).WebSocket
       new W('ws://192.168.100.10:3000/plugins/signalk-onvif-camera/ws')
       new W('/api/stream')
       new W('wss://other.example.com/socket')
       new W('/plugins/signalk-embedded-webapp-proxy/proxy/0/already')
+      // URL-object inputs (e.g. Portainer's `new WebSocket(new URL(path, origin))`)
+      // must be coerced and rewritten the same way strings are.
+      const urlLike: { href: string; toString(): string } = {
+        href: 'wss://192.168.100.10:3000/api/websocket/exec?token=abc',
+        toString(): string {
+          return this.href
+        },
+      }
+      new W(urlLike)
 
       expect(created[0]).toBe(
         'ws://192.168.100.10:3000/plugins/signalk-embedded-webapp-proxy/proxy/0/plugins/signalk-onvif-camera/ws',
@@ -1438,6 +1611,9 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       )
       expect(created[2]).toBe('wss://other.example.com/socket')
       expect(created[3]).toBe('/plugins/signalk-embedded-webapp-proxy/proxy/0/already')
+      expect(created[4]).toBe(
+        'ws://192.168.100.10:3000/plugins/signalk-embedded-webapp-proxy/proxy/0/api/websocket/exec?token=abc',
+      )
     })
 
     it('uses appPath in the rewritten attribute prefix', async () => {
