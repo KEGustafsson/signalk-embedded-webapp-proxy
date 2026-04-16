@@ -227,6 +227,27 @@ describe('AppPanel', () => {
       expect(toolbar).toHaveStyle({ top: '0px' })
     })
 
+    it('toolbar stays visible indefinitely while no app is selected', async () => {
+      // The dropdown must remain reachable until the user picks an app —
+      // auto-hiding it before any selection would strand the user with no
+      // visible way to choose one.
+      mockFetchApps(twoApps)
+      render(<AppPanel />)
+      const toolbar = await screen.findByTestId('toolbar')
+
+      // Mouse leave shouldn't schedule a hide while nothing is selected.
+      act(() => {
+        fireEvent.mouseLeave(toolbar)
+      })
+      // Advance well past the auto-hide delay.
+      act(() => {
+        jest.advanceTimersByTime(10000)
+      })
+
+      expect(screen.getByTestId('toolbar')).toHaveStyle({ top: '0px' })
+      expect(screen.queryByTestId('hot-zone')).not.toBeInTheDocument()
+    })
+
     it('toolbar hides after selecting an app and timeout elapses', async () => {
       mockFetchApps(twoApps)
       render(<AppPanel />)
