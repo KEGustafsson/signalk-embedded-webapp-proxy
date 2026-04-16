@@ -281,16 +281,23 @@ function applyForwardedHeaders(
 // Rewrite the outgoing Origin header so upstream apps that enforce same-origin
 // WebSocket / CORS policy see a value matching the target host (which
 // changeOrigin:true has already rewritten into the Host header). The original
-// Origin is preserved in X-Forwarded-Host via applyForwardedHeaders, so apps
-// that need it can still recover it.
-//
-// SECURITY: Only rewrite when the incoming Origin matches the proxy's own
-// origin (a legitimate same-site request from the embedded iframe).
-// Cross-origin values MUST be passed through unchanged so upstream CSRF /
-// origin-based protections can evaluate them — an unconditional rewrite would
-// forge cross-site requests into same-origin ones and bypass those defenses
-// whenever auth cookies are attached. Leaves Origin untouched when the
+// Host is preserved in X-Forwarded-Host via applyForwardedHeaders, so apps
+// that need it can still recover it. Leaves Origin untouched when the
 // incoming request has no Origin header (non-browser clients).
+//
+// SECURITY TRADEOFF: This rewrites Origin unconditionally — mirroring the
+// canonical reverse-proxy recipe for apps like Portainer and Grafana
+// (`proxy_set_header Origin $host;` in nginx). That means if an upstream app
+// uses cookie-based auth *and* relies on Origin for CSRF protection *and*
+// sets its cookies with SameSite=None, a cross-site credentialed request
+// would have its Origin forged into a same-site one. In practice this vector
+// is narrow: modern browsers default cookies to SameSite=Lax (blocking
+// cross-site credentialed POSTs outright), Portainer uses JWT-in-header
+// rather than cookies, and this plugin is documented for trusted-network
+// deployments. We prefer compatibility with real apps over defense against
+// this specific layered failure. A conditional rewrite (0.3.2) broke
+// Portainer deletes in the field; unconditional rewrite is the pragmatic
+// choice.
 function rewriteOriginHeader(
   proxyReq: ClientRequest,
   req: IncomingMessage,
@@ -299,27 +306,9 @@ function rewriteOriginHeader(
   const incoming = req.headers['origin']
   const origin =
     typeof incoming === 'string' ? incoming : Array.isArray(incoming) ? (incoming[0] ?? '') : ''
-  if (origin.length === 0) return
-
-  const host = req.headers['host']
-  if (typeof host !== 'string' || host.length === 0) return
-
-  // Trust X-Forwarded-Proto if SignalK itself sits behind a TLS terminator,
-  // otherwise fall back to the socket's encrypted flag.
-  const xfp = req.headers['x-forwarded-proto']
-  const rawProto = typeof xfp === 'string' ? xfp : Array.isArray(xfp) ? (xfp[0] ?? '') : ''
-  const fwdProto = rawProto.split(',')[0]?.trim()
-  const scheme =
-    fwdProto === 'http' || fwdProto === 'https'
-      ? fwdProto
-      : (req.socket as { encrypted?: boolean }).encrypted
-        ? 'https'
-        : 'http'
-
-  const proxyOrigin = `${scheme}://${host}`
-  if (origin !== proxyOrigin) return
-
-  proxyReq.setHeader('Origin', targetOrigin)
+  if (origin.length > 0) {
+    proxyReq.setHeader('Origin', targetOrigin)
+  }
 }
 
 function parseAppConfig(raw: Record<string, unknown>, index: number): AppConfig {

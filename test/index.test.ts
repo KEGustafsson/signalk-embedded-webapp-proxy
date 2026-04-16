@@ -485,57 +485,6 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(setCalls.find(([k]) => k === 'Origin')).toBeUndefined()
     })
 
-    it('does not rewrite cross-origin requests on HTTP proxyReq (CSRF defense)', () => {
-      // A request initiated from another site (Origin: https://evil.example)
-      // that reaches the proxy with auth cookies must NOT be forged into a
-      // same-origin request. The original Origin must be passed through so
-      // upstream CSRF / Origin checks can reject it.
-      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
-
-      plugin.start(oneApp({ url: 'https://127.0.0.1:9443' }), jest.fn())
-
-      const proxyReqHandler = extractProxyReqHandler()
-
-      const mockProxyReq = { setHeader: jest.fn() }
-      proxyReqHandler(mockProxyReq, {
-        socket: { remoteAddress: '10.0.0.8', encrypted: true },
-        headers: {
-          origin: 'https://evil.example',
-          host: 'signalk.local:3443',
-        },
-      })
-
-      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
-      // Origin must not have been overwritten; the upstream will see the
-      // browser's untampered Origin: https://evil.example.
-      expect(setCalls.find(([k]) => k === 'Origin')).toBeUndefined()
-    })
-
-    it('honors X-Forwarded-Proto when detecting same-origin on HTTP proxyReq', () => {
-      // SignalK may itself sit behind an HTTPS-terminating reverse proxy. In
-      // that case socket.encrypted is false but X-Forwarded-Proto: https tells
-      // us the browser saw https, which is what it puts in Origin.
-      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
-
-      plugin.start(oneApp({ url: 'https://127.0.0.1:9443' }), jest.fn())
-
-      const proxyReqHandler = extractProxyReqHandler()
-
-      const mockProxyReq = { setHeader: jest.fn() }
-      proxyReqHandler(mockProxyReq, {
-        socket: { remoteAddress: '10.0.0.9', encrypted: false },
-        headers: {
-          origin: 'https://signalk.local:3443',
-          host: 'signalk.local:3443',
-          'x-forwarded-proto': 'https',
-        },
-      })
-
-      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
-      const headerMap = Object.fromEntries(setCalls.map(([k, v]) => [k, v]))
-      expect(headerMap['Origin']).toBe('https://127.0.0.1:9443')
-    })
-
     it('ignores allowSelfSigned when scheme is http', () => {
       plugin.start(oneApp({ allowSelfSigned: true }), jest.fn())
 
@@ -1074,27 +1023,6 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       proxyReqWs(mockProxyReq, {
         socket: { remoteAddress: '10.0.0.11', encrypted: true },
         headers: { host: 'signalk.local:3443' },
-      })
-
-      const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
-      expect(setCalls.find(([k]) => k === 'Origin')).toBeUndefined()
-    })
-
-    it('does not rewrite cross-origin WebSocket upgrades (CSRF defense)', () => {
-      // A WebSocket upgrade initiated from another site must not be forged
-      // into a same-origin request; upstream Origin-based access control
-      // (common for WS endpoints that skip CSRF tokens) must still see the
-      // browser's real Origin so it can reject the connection.
-      plugin.start(oneApp({ url: 'https://127.0.0.1:9443' }), jest.fn())
-
-      const proxyReqWs = extractProxyReqWsHandler()
-      const mockProxyReq = { setHeader: jest.fn() }
-      proxyReqWs(mockProxyReq, {
-        socket: { remoteAddress: '10.0.0.13', encrypted: true },
-        headers: {
-          host: 'signalk.local:3443',
-          origin: 'https://evil.example',
-        },
       })
 
       const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
