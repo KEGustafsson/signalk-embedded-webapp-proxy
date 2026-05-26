@@ -456,6 +456,9 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
   // Normalise: strip trailing slash; "/" becomes "" (no stripping needed).
   const base = appBasePath === '/' ? '' : appBasePath.replace(/\/$/, '')
   const baseJson = jsLiteral(base)
+  // Generate the root-namespace check from ROOT_NAMESPACES so the client-side T()
+  // stays automatically in sync with the server-side isRootNamespace().
+  const rootCheckJs = ROOT_NAMESPACES.map((ns) => `s.indexOf(${jsLiteral(ns)})===0`).join('||')
   return (
     '<script data-signalk-embedded-webapp-proxy="path-rewrite">' +
     '(function(){' +
@@ -472,7 +475,7 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     'function T(s){if(!B)return s;' +
     'if(s.indexOf(B+"/")===0)return s.slice(B.length);' +
     'if(s===B)return "/";' +
-    'if(s.indexOf("/plugins/")===0||s.indexOf("/signalk/")===0||s.indexOf("/admin/")===0||s.indexOf("/skServer/")===0)return "/__root__"+s;' +
+    `if(${rootCheckJs})return "/__root__"+s;` +
     'return s}' +
     // R: true for root-relative paths (/foo) but not protocol-relative (//host) or already-proxied
     "function R(s){return typeof s==='string'&&s.charAt(0)==='/'&&s.charAt(1)!=='/'&&s.indexOf(P)!==0}" +
@@ -802,22 +805,18 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                     const chunks: Buffer[] = []
                     let totalBytes = 0
                     let aborted = false
-                    let pipedThrough = false
                     stream.on('data', (chunk: Buffer) => {
                       if (aborted) return
                       totalBytes += chunk.length
                       if (totalBytes > MAX_HTML_REWRITE_BYTES) {
-                        // Body exceeded the rewrite cap.  Stop buffering and
-                        // forward the rest of the (original, still-encoded)
-                        // upstream stream untouched so the client at least
-                        // sees a valid response — even though it won't be
-                        // path-rewritten.
+                        // Response exceeds the rewrite cap. Once the decompressor
+                        // has consumed part of proxyRes the remaining compressed
+                        // bytes are mid-stream — forwarding them verbatim would
+                        // produce a corrupt response. Send 502 instead.
                         aborted = true
-                        if (!pipedThrough) {
-                          pipedThrough = true
-                          // Discard any decompression pipeline we set up;
-                          // give the client the original bytes verbatim.
-                          streamThrough(proxyRes, res, status)
+                        if (!res.headersSent) {
+                          res.writeHead(502, { 'Content-Type': 'text/plain' })
+                          res.end('Bad Gateway: response too large to rewrite')
                         }
                         return
                       }

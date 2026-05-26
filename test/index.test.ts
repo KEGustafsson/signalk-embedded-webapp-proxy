@@ -623,6 +623,12 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(mockCreateProxyMiddleware).toHaveBeenCalledTimes(2)
     })
 
+    it('skips app when appPath exceeds 64 characters', () => {
+      plugin.start(oneApp({ appPath: 'a'.repeat(65) }), jest.fn())
+      expect(mockCreateProxyMiddleware).not.toHaveBeenCalled()
+      expect(mockError).toHaveBeenCalledWith(expect.stringContaining('exceeds 64 characters'))
+    })
+
     it('always enables selfHandleResponse and proxyRes handler', () => {
       plugin.start(oneApp(), jest.fn())
 
@@ -2348,6 +2354,114 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       }
       handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
       expect(headers['location']).not.toContain('__root__')
+    })
+
+    it('handles HTML with unclosed <script> tag by keeping remainder verbatim', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      const { body } = await runHtmlProxyRes(
+        handler,
+        '<html><head><script src="/app.js">var x = 1; // unclosed',
+      )
+      const html = body.toString()
+      expect(html).toContain('src="/plugins/signalk-embedded-webapp-proxy/proxy/0/app.js"')
+      expect(html).toContain('var x = 1; // unclosed')
+    })
+
+    it('returns 502 when HTML response exceeds the rewrite size cap', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      Object.assign(proxyResStream, {
+        headers: { 'content-type': 'text/html' },
+        statusCode: 200,
+      })
+
+      let resolveEnd!: () => void
+      const endPromise = new Promise<void>((resolve) => {
+        resolveEnd = resolve
+      })
+      const mockRes = {
+        writeHead: jest.fn(),
+        end: jest.fn(() => resolveEnd()),
+        headersSent: false,
+      }
+
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
+      proxyResStream.write(Buffer.alloc(11 * 1024 * 1024, 65)) // 11 MiB of 'A'
+      proxyResStream.end()
+
+      await endPromise
+
+      expect(mockRes.writeHead).toHaveBeenCalledWith(502, { 'Content-Type': 'text/plain' })
+      expect(mockRes.end).toHaveBeenCalledWith('Bad Gateway: response too large to rewrite')
+    })
+
+    it('returns 502 when gzip decompression of HTML fails', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      Object.assign(proxyResStream, {
+        headers: { 'content-type': 'text/html', 'content-encoding': 'gzip' },
+        statusCode: 200,
+      })
+
+      let resolveEnd!: () => void
+      const endPromise = new Promise<void>((resolve) => {
+        resolveEnd = resolve
+      })
+      const mockRes = {
+        writeHead: jest.fn(),
+        end: jest.fn(() => resolveEnd()),
+        headersSent: false,
+      }
+
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
+      proxyResStream.write(Buffer.from('this is not valid gzip data'))
+      proxyResStream.end()
+
+      await endPromise
+
+      expect(mockRes.writeHead).toHaveBeenCalledWith(502, { 'Content-Type': 'text/plain' })
+      expect(mockRes.end).toHaveBeenCalledWith('Bad Gateway: decompression error')
+    })
+
+    it('returns 502 when proxyRes source stream errors during HTML decompression', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      Object.assign(proxyResStream, {
+        headers: { 'content-type': 'text/html', 'content-encoding': 'gzip' },
+        statusCode: 200,
+      })
+
+      let resolveEnd!: () => void
+      const endPromise = new Promise<void>((resolve) => {
+        resolveEnd = resolve
+      })
+      const mockRes = {
+        writeHead: jest.fn(),
+        end: jest.fn(() => resolveEnd()),
+        headersSent: false,
+      }
+
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
+      proxyResStream.emit('error', new Error('upstream disconnected'))
+
+      await endPromise
+
+      expect(mockRes.writeHead).toHaveBeenCalledWith(502, { 'Content-Type': 'text/plain' })
+      expect(mockRes.end).toHaveBeenCalledWith('Bad Gateway: upstream error')
     })
 
     it('forwards X-Forwarded-Host from the incoming Host header', () => {
