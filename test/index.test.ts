@@ -1622,6 +1622,58 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       )
     })
 
+    it('does not root-escape this plugin\'s own prefix paths in the client script (mirrors isRootNamespace)', async () => {
+      // App with a base path so T() is active (T() short-circuits when B is empty)
+      plugin.start(
+        oneApp({ url: 'http://localhost:3000/grafana', rewritePaths: true }),
+        jest.fn(),
+      )
+      const handler = extractProxyResHandler()
+      const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
+      const scriptMatch = body
+        .toString()
+        .match(/<script data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/)
+      expect(scriptMatch).not.toBeNull()
+      const scriptBody = scriptMatch![1]!
+
+      const fetched: string[] = []
+      const sandbox = {
+        window: {
+          fetch: (u: string) => {
+            fetched.push(u)
+            return Promise.resolve()
+          },
+          location: { protocol: 'http:', host: '192.168.100.10:3000', assign() {}, replace() {} },
+          WebSocket: null,
+          history: null,
+          MutationObserver: null,
+        } as Record<string, unknown>,
+        XMLHttpRequest: { prototype: { open() {} } },
+        Location: { prototype: {} },
+        Object,
+      }
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const vm = require('vm') as typeof import('vm')
+      vm.createContext(sandbox)
+      vm.runInContext(scriptBody, sandbox)
+
+      const fetch = (sandbox.window as { fetch: (u: string) => void }).fetch
+      // Sibling plugin path — must NOT get /__root__ escape (mirrors isRootNamespace exclusion)
+      fetch('/plugins/signalk-embedded-webapp-proxy/apps')
+      // Other plugin path — must still go through __root__
+      fetch('/plugins/signalk-onvif-camera/ws')
+      // Normal app path — stripped of base prefix
+      fetch('/grafana/api/health')
+
+      // Plugin's own prefix: no /__root__, just proxy-prefixed
+      expect(fetched[0]).not.toContain('__root__')
+      expect(fetched[0]).toContain('/plugins/signalk-embedded-webapp-proxy/apps')
+      // Other plugin namespace: routed via __root__
+      expect(fetched[1]).toContain('/__root__/plugins/signalk-onvif-camera/ws')
+      // In-base path: base stripped, proxy prefix applied
+      expect(fetched[2]).not.toContain('/grafana/grafana')
+    })
+
     it('uses appPath in the rewritten attribute prefix', async () => {
       plugin.start(
         {
