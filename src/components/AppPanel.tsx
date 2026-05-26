@@ -41,10 +41,11 @@ const AppPanel: React.FC = () => {
     clearHideTimer()
     // Don't auto-hide while no app is selected — the user still needs the
     // dropdown to make a choice. Once an app is picked, the iframe takes
-    // over and the toolbar can retract.
-    if (selected === null) return
+    // over and the toolbar can retract. Also skip when there's only one app
+    // since the toolbar is never rendered in that case.
+    if (selected === null || apps.length <= 1) return
     hideTimer.current = setTimeout(() => setBarVisible(false), AUTO_HIDE_DELAY)
-  }, [clearHideTimer, selected])
+  }, [clearHideTimer, selected, apps.length])
 
   const revealToolbar = React.useCallback(() => {
     clearHideTimer()

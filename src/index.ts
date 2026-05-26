@@ -456,13 +456,22 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
   // Normalise: strip trailing slash; "/" becomes "" (no stripping needed).
   const base = appBasePath === '/' ? '' : appBasePath.replace(/\/$/, '')
   const baseJson = jsLiteral(base)
+  // Generate the root-namespace check from ROOT_NAMESPACES so the client-side T()
+  // stays automatically in sync with the server-side isRootNamespace().
+  const rootCheckJs = ROOT_NAMESPACES.map((ns) => `s.indexOf(${jsLiteral(ns)})===0`).join('||')
+  // Plugin prefix used to mirror isRootNamespace()'s exclusion: paths that
+  // belong to this plugin are never root-escaped on the server, so they must
+  // not be root-escaped on the client either.
+  const pluginPrefix = jsLiteral(PLUGIN_PATH_PREFIX)
   return (
     '<script data-signalk-embedded-webapp-proxy="path-rewrite">' +
     '(function(){' +
     `var P=${prefix};` +
     `var B=${baseJson};` +
+    `var PP=${pluginPrefix};` +
     // T: transform a root-relative path into the suffix that follows the proxy prefix.
     //    - Inside B (app base): strip B so the upstream target's base path isn't double-prefixed.
+    //    - Belongs to this plugin (PP): never root-escape — mirrors isRootNamespace() exclusion.
     //    - Outside B but inside a known SignalK-server root namespace (/plugins/, /signalk/,
     //      /admin/, /skServer/): prepend __root__ so the server routes through the host-only
     //      proxy (e.g. onvif webapp reaching /plugins/signalk-onvif-camera/ws).
@@ -472,7 +481,8 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     'function T(s){if(!B)return s;' +
     'if(s.indexOf(B+"/")===0)return s.slice(B.length);' +
     'if(s===B)return "/";' +
-    'if(s.indexOf("/plugins/")===0||s.indexOf("/signalk/")===0||s.indexOf("/admin/")===0||s.indexOf("/skServer/")===0)return "/__root__"+s;' +
+    'if(s===PP||s.indexOf(PP+"/")===0)return s;' +
+    `if(${rootCheckJs})return "/__root__"+s;` +
     'return s}' +
     // R: true for root-relative paths (/foo) but not protocol-relative (//host) or already-proxied
     "function R(s){return typeof s==='string'&&s.charAt(0)==='/'&&s.charAt(1)!=='/'&&s.indexOf(P)!==0}" +
@@ -802,22 +812,31 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                     const chunks: Buffer[] = []
                     let totalBytes = 0
                     let aborted = false
-                    let pipedThrough = false
                     stream.on('data', (chunk: Buffer) => {
                       if (aborted) return
                       totalBytes += chunk.length
                       if (totalBytes > MAX_HTML_REWRITE_BYTES) {
-                        // Body exceeded the rewrite cap.  Stop buffering and
-                        // forward the rest of the (original, still-encoded)
-                        // upstream stream untouched so the client at least
-                        // sees a valid response — even though it won't be
-                        // path-rewritten.
+                        // Response exceeds the rewrite cap. Once the decompressor
+                        // has consumed part of proxyRes the remaining compressed
+                        // bytes are mid-stream — forwarding them verbatim would
+                        // produce a corrupt response. Destroy both streams to
+                        // stop background reads, then send 502.
                         aborted = true
-                        if (!pipedThrough) {
-                          pipedThrough = true
-                          // Discard any decompression pipeline we set up;
-                          // give the client the original bytes verbatim.
-                          streamThrough(proxyRes, res, status)
+                        try {
+                          // NodeJS.ReadableStream lacks destroy() in its interface
+                          // but all concrete types (Gunzip, Inflate, etc.) have it.
+                          ;(stream as unknown as { destroy(): void }).destroy()
+                        } catch {
+                          // ignore — stream may already be destroyed
+                        }
+                        try {
+                          proxyRes.destroy()
+                        } catch {
+                          // ignore — same stream when no decompressor is used
+                        }
+                        if (!res.headersSent) {
+                          res.writeHead(502, { 'Content-Type': 'text/plain' })
+                          res.end('Bad Gateway: response too large to rewrite')
                         }
                         return
                       }

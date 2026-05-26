@@ -60,6 +60,16 @@ describe('AppPanel', () => {
       render(<AppPanel />)
       expect(await screen.findByText(/Unable to load the application list/i)).toBeInTheDocument()
     })
+
+    it('silently ignores AbortError when fetch is cancelled on unmount', async () => {
+      const abortError = new DOMException('Aborted', 'AbortError')
+      global.fetch = jest.fn().mockRejectedValue(abortError)
+      render(<AppPanel />)
+      // AbortError is caught and suppressed; setLoadError is not called.
+      // setLoading(false) fires via finally, leaving apps=[] with no error flag.
+      expect(await screen.findByText(/No web applications configured/i)).toBeInTheDocument()
+      expect(screen.queryByText(/Unable to load/i)).not.toBeInTheDocument()
+    })
   })
 
   describe('single app', () => {

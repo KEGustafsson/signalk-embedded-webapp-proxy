@@ -623,6 +623,12 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(mockCreateProxyMiddleware).toHaveBeenCalledTimes(2)
     })
 
+    it('skips app when appPath exceeds 64 characters', () => {
+      plugin.start(oneApp({ appPath: 'a'.repeat(65) }), jest.fn())
+      expect(mockCreateProxyMiddleware).not.toHaveBeenCalled()
+      expect(mockError).toHaveBeenCalledWith(expect.stringContaining('exceeds 64 characters'))
+    })
+
     it('always enables selfHandleResponse and proxyRes handler', () => {
       plugin.start(oneApp(), jest.fn())
 
@@ -1616,6 +1622,55 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       )
     })
 
+    it("does not root-escape this plugin's own prefix paths in the client script (mirrors isRootNamespace)", async () => {
+      // App with a base path so T() is active (T() short-circuits when B is empty)
+      plugin.start(oneApp({ url: 'http://localhost:3000/grafana', rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+      const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
+      const scriptMatch = body
+        .toString()
+        .match(/<script data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/)
+      expect(scriptMatch).not.toBeNull()
+      const scriptBody = scriptMatch![1]!
+
+      const fetched: string[] = []
+      const sandbox = {
+        window: {
+          fetch: (u: string) => {
+            fetched.push(u)
+            return Promise.resolve()
+          },
+          location: { protocol: 'http:', host: '192.168.100.10:3000', assign() {}, replace() {} },
+          WebSocket: null,
+          history: null,
+          MutationObserver: null,
+        } as Record<string, unknown>,
+        XMLHttpRequest: { prototype: { open() {} } },
+        Location: { prototype: {} },
+        Object,
+      }
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const vm = require('vm') as typeof import('vm')
+      vm.createContext(sandbox)
+      vm.runInContext(scriptBody, sandbox)
+
+      const fetch = (sandbox.window as { fetch: (u: string) => void }).fetch
+      // Sibling plugin path — must NOT get /__root__ escape (mirrors isRootNamespace exclusion)
+      fetch('/plugins/signalk-embedded-webapp-proxy/apps')
+      // Other plugin path — must still go through __root__
+      fetch('/plugins/signalk-onvif-camera/ws')
+      // Normal app path — stripped of base prefix
+      fetch('/grafana/api/health')
+
+      // Plugin's own prefix: no /__root__, just proxy-prefixed
+      expect(fetched[0]).not.toContain('__root__')
+      expect(fetched[0]).toContain('/plugins/signalk-embedded-webapp-proxy/apps')
+      // Other plugin namespace: routed via __root__
+      expect(fetched[1]).toContain('/__root__/plugins/signalk-onvif-camera/ws')
+      // In-base path: base stripped, proxy prefix applied
+      expect(fetched[2]).not.toContain('/grafana/grafana')
+    })
+
     it('uses appPath in the rewritten attribute prefix', async () => {
       plugin.start(
         {
@@ -2348,6 +2403,114 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       }
       handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
       expect(headers['location']).not.toContain('__root__')
+    })
+
+    it('handles HTML with unclosed <script> tag by keeping remainder verbatim', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      const { body } = await runHtmlProxyRes(
+        handler,
+        '<html><head><script src="/app.js">var x = 1; // unclosed',
+      )
+      const html = body.toString()
+      expect(html).toContain('src="/plugins/signalk-embedded-webapp-proxy/proxy/0/app.js"')
+      expect(html).toContain('var x = 1; // unclosed')
+    })
+
+    it('returns 502 when HTML response exceeds the rewrite size cap', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      Object.assign(proxyResStream, {
+        headers: { 'content-type': 'text/html' },
+        statusCode: 200,
+      })
+
+      let resolveEnd!: () => void
+      const endPromise = new Promise<void>((resolve) => {
+        resolveEnd = resolve
+      })
+      const mockRes = {
+        writeHead: jest.fn(),
+        end: jest.fn(() => resolveEnd()),
+        headersSent: false,
+      }
+
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
+      proxyResStream.write(Buffer.alloc(11 * 1024 * 1024, 65)) // 11 MiB of 'A'
+      proxyResStream.end()
+
+      await endPromise
+
+      expect(mockRes.writeHead).toHaveBeenCalledWith(502, { 'Content-Type': 'text/plain' })
+      expect(mockRes.end).toHaveBeenCalledWith('Bad Gateway: response too large to rewrite')
+    })
+
+    it('returns 502 when gzip decompression of HTML fails', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      Object.assign(proxyResStream, {
+        headers: { 'content-type': 'text/html', 'content-encoding': 'gzip' },
+        statusCode: 200,
+      })
+
+      let resolveEnd!: () => void
+      const endPromise = new Promise<void>((resolve) => {
+        resolveEnd = resolve
+      })
+      const mockRes = {
+        writeHead: jest.fn(),
+        end: jest.fn(() => resolveEnd()),
+        headersSent: false,
+      }
+
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
+      proxyResStream.write(Buffer.from('this is not valid gzip data'))
+      proxyResStream.end()
+
+      await endPromise
+
+      expect(mockRes.writeHead).toHaveBeenCalledWith(502, { 'Content-Type': 'text/plain' })
+      expect(mockRes.end).toHaveBeenCalledWith('Bad Gateway: decompression error')
+    })
+
+    it('returns 502 when proxyRes source stream errors during HTML decompression', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      Object.assign(proxyResStream, {
+        headers: { 'content-type': 'text/html', 'content-encoding': 'gzip' },
+        statusCode: 200,
+      })
+
+      let resolveEnd!: () => void
+      const endPromise = new Promise<void>((resolve) => {
+        resolveEnd = resolve
+      })
+      const mockRes = {
+        writeHead: jest.fn(),
+        end: jest.fn(() => resolveEnd()),
+        headersSent: false,
+      }
+
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
+      proxyResStream.emit('error', new Error('upstream disconnected'))
+
+      await endPromise
+
+      expect(mockRes.writeHead).toHaveBeenCalledWith(502, { 'Content-Type': 'text/plain' })
+      expect(mockRes.end).toHaveBeenCalledWith('Bad Gateway: upstream error')
     })
 
     it('forwards X-Forwarded-Host from the incoming Host header', () => {
