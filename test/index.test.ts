@@ -1622,12 +1622,9 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       )
     })
 
-    it('does not root-escape this plugin\'s own prefix paths in the client script (mirrors isRootNamespace)', async () => {
+    it("does not root-escape this plugin's own prefix paths in the client script (mirrors isRootNamespace)", async () => {
       // App with a base path so T() is active (T() short-circuits when B is empty)
-      plugin.start(
-        oneApp({ url: 'http://localhost:3000/grafana', rewritePaths: true }),
-        jest.fn(),
-      )
+      plugin.start(oneApp({ url: 'http://localhost:3000/grafana', rewritePaths: true }), jest.fn())
       const handler = extractProxyResHandler()
       const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
       const scriptMatch = body
