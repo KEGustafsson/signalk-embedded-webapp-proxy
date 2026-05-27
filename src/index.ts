@@ -2,6 +2,7 @@ import type { Plugin, ServerAPI } from '@signalk/server-api'
 import type { IRouter, Request, Response } from 'express'
 import type { ClientRequest, IncomingMessage, Server, ServerResponse } from 'http'
 import { Socket } from 'net'
+import { Readable } from 'stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'zlib'
 import { createProxyMiddleware, fixRequestBody, type RequestHandler } from 'http-proxy-middleware'
 
@@ -111,6 +112,37 @@ function computeProxiedSuffix(url: string, appBasePath: string): string {
   return url
 }
 
+// Split a Set-Cookie header value into its attributes, respecting the
+// RFC 6265 quoted-string rule for cookie-value (the first segment). This
+// prevents a malicious upstream from embedding a `;` inside a quoted
+// cookie-value to inject a fake `Path=` attribute that would otherwise
+// shadow the legitimate one.
+function splitCookieAttributes(cookie: string): string[] {
+  const parts: string[] = []
+  let buf = ''
+  let inQuotes = false
+  // The cookie-value may be a quoted string but only for the *first*
+  // attribute (cookie-pair). After that, attribute values are unquoted per
+  // the grammar in RFC 6265 §5.2 — but in practice browsers tolerate
+  // quoting elsewhere. To stay safe we honour quotes wherever they appear.
+  for (let i = 0; i < cookie.length; i++) {
+    const ch = cookie.charAt(i)
+    if (ch === '"') {
+      inQuotes = !inQuotes
+      buf += ch
+      continue
+    }
+    if (ch === ';' && !inQuotes) {
+      parts.push(buf)
+      buf = ''
+      continue
+    }
+    buf += ch
+  }
+  if (buf.length > 0) parts.push(buf)
+  return parts
+}
+
 // Rewrite the Path attribute of one or more Set-Cookie header values so the
 // browser sends the cookie back when requesting the proxied app.  Without
 // this, upstream cookies set with Path=/ (or Path=/api) would be stored
@@ -120,14 +152,22 @@ function computeProxiedSuffix(url: string, appBasePath: string): string {
 // Also strips Domain attributes — at this layer the cookie will be set on the
 // SignalK origin regardless, and a stale Domain pointing at the upstream host
 // would just cause the browser to drop the cookie.
+//
+// Defends against two upstream-controlled attacks: (1) splitting the
+// cookie on raw `;` would break apart quoted cookie-values like
+// `data="a;b"`, so we use splitCookieAttributes which honours quotes;
+// (2) only the FIRST Path attribute is honoured — additional Path tokens
+// (legal per the grammar but rejected by browsers) are dropped so an
+// attacker can't push a real Path off the relevant position.
 function rewriteSetCookie(
   values: string[],
   proxyPathPrefix: string,
   appBasePath: string,
 ): string[] {
   return values.map((cookie) => {
-    const parts = cookie.split(';')
+    const parts = splitCookieAttributes(cookie)
     const out: string[] = []
+    let sawPath = false
     for (const raw of parts) {
       const part = raw.trim()
       if (!part) continue
@@ -138,16 +178,36 @@ function rewriteSetCookie(
         continue
       }
       if (name === 'path') {
-        const value = eq >= 0 ? part.slice(eq + 1).trim() : ''
+        if (sawPath) continue // drop duplicates; first Path wins
+        sawPath = true
+        let value = eq >= 0 ? part.slice(eq + 1).trim() : ''
+        // Strip surrounding quotes (RFC 6265 doesn't allow it, but real
+        // upstreams sometimes emit Path="…"; honouring the quotes prevents
+        // the leading `"` from defeating the `/` check below).
         if (
-          value.charAt(0) === '/' &&
-          !value.startsWith(proxyPathPrefix + '/') &&
-          value !== proxyPathPrefix
+          value.length >= 2 &&
+          value.charAt(0) === '"' &&
+          value.charAt(value.length - 1) === '"'
         ) {
-          const suffix = computeProxiedSuffix(value, appBasePath)
-          out.push(`Path=${proxyPathPrefix}${suffix}`)
+          value = value.slice(1, -1)
+        }
+        if (value.charAt(0) !== '/') {
+          // Not a root-relative path — leave as-is.
+          out.push(part)
           continue
         }
+        // If the Path is already correctly scoped to this app's proxy
+        // subtree, leave it untouched. Anything else — including paths
+        // that target the parent plugin prefix or a sibling app's prefix
+        // — gets rewritten so a malicious upstream cannot scope cookies
+        // to read another proxied app's traffic.
+        if (value === proxyPathPrefix || value.startsWith(proxyPathPrefix + '/')) {
+          out.push(`Path=${value}`)
+          continue
+        }
+        const suffix = computeProxiedSuffix(value, appBasePath)
+        out.push(`Path=${proxyPathPrefix}${suffix}`)
+        continue
       }
       out.push(part)
     }
@@ -252,8 +312,16 @@ function computeTargetOrigin(appConfig: AppConfig): string {
 // Apply X-Real-IP / X-Forwarded-* to an outgoing proxied request. Shared between
 // HTTP (`proxyReq`) and WebSocket upgrade (`proxyReqWs`) hooks — the only
 // difference is the default protocol label ("http"/"https" vs "ws"/"wss").
-// If the incoming request already carries X-Forwarded-Proto (we're behind
-// another reverse proxy), its first value wins so the full chain is preserved.
+//
+// SECURITY: Do not extend an attacker-controllable X-Forwarded-For chain.
+// Upstream apps commonly trust the LEFTMOST value as the "real" client IP;
+// accepting client-supplied entries lets the caller spoof that field. The
+// chain is overwritten with `<remoteAddress>` — the only value this proxy
+// has actually observed. If this plugin is ever deployed behind another
+// trusted reverse proxy that the operator wants to inherit a chain from,
+// that's a configuration knob to add explicitly, not a default behaviour.
+// X-Forwarded-Proto is similarly validated against a strict allow-list
+// because some upstreams use it for HTTPS-only cookie decisions.
 function applyForwardedHeaders(
   proxyReq: ClientRequest,
   req: IncomingMessage,
@@ -261,13 +329,15 @@ function applyForwardedHeaders(
 ): void {
   const remoteAddress = req.socket?.remoteAddress ?? ''
   proxyReq.setHeader('X-Real-IP', remoteAddress)
-  const existing = req.headers['x-forwarded-for']
-  const forwarded = existing ? `${String(existing)}, ${remoteAddress}` : remoteAddress
-  proxyReq.setHeader('X-Forwarded-For', forwarded)
+  proxyReq.setHeader('X-Forwarded-For', remoteAddress)
   const incomingProto = req.headers['x-forwarded-proto']
   const rawProto = typeof incomingProto === 'string' ? incomingProto : (incomingProto?.[0] ?? '')
-  const proto = rawProto.split(',')[0]?.trim() || defaultProto
-  proxyReq.setHeader('X-Forwarded-Proto', proto)
+  const firstProto = rawProto.split(',')[0]?.trim().toLowerCase() ?? ''
+  const validProto =
+    firstProto === 'http' || firstProto === 'https' || firstProto === 'ws' || firstProto === 'wss'
+      ? firstProto
+      : defaultProto
+  proxyReq.setHeader('X-Forwarded-Proto', validProto)
   // Forward the original Host so upstream apps that build absolute URLs (share
   // links, OAuth callbacks) can still reach this proxy. changeOrigin: true
   // rewrites the wire Host header to the target, so X-Forwarded-Host is the
@@ -398,9 +468,19 @@ function parseAppConfig(raw: Record<string, unknown>, index: number): AppConfig 
 function parseConfig(config: object, onSkip: (index: number, err: unknown) => void): AppConfig[] {
   const raw = config as Record<string, unknown>
   const apps = Array.isArray(raw['apps']) ? raw['apps'] : []
-  const validObjects = apps
-    .filter((a): a is Record<string, unknown> => typeof a === 'object' && a !== null)
-    .slice(0, MAX_APP_SLOTS)
+  const objectApps = apps.filter(
+    (a): a is Record<string, unknown> => typeof a === 'object' && a !== null,
+  )
+  // Cap the number of configured apps to avoid pathological config sizes
+  // exhausting resources. Silently dropping the overflow would be confusing
+  // for an operator wondering why their 17th app isn't reachable — surface
+  // the truncation via the skip callback so it lands in the SignalK log.
+  if (objectApps.length > MAX_APP_SLOTS) {
+    for (let i = MAX_APP_SLOTS; i < objectApps.length; i++) {
+      onSkip(i, new Error(`exceeds MAX_APP_SLOTS=${String(MAX_APP_SLOTS)}; ignored`))
+    }
+  }
+  const validObjects = objectApps.slice(0, MAX_APP_SLOTS)
   const results: AppConfig[] = []
   const seenPaths = new Set<string>()
   for (let i = 0; i < validObjects.length; i++) {
@@ -444,13 +524,24 @@ function resolveAppIndex(appId: string, apps: AppConfig[]): number {
  * (e.g. "/grafana/d/..."), the normaliser strips that prefix before prepending
  * the proxy path prefix — preventing double-prefixing like "/proxy/grafana/grafana/d/...".
  */
-// Escape '<' so JSON-stringified literals embedded in an inline <script> tag
-// cannot break out via "</script>". URL pathnames and validated appPath values
-// never contain '<' in practice, but defensive escaping is cheap insurance.
+// Escape characters that would otherwise let a JSON-stringified literal
+// embedded in an inline <script> tag break out of script context:
+//   - '<'   prevents "</script>" termination
+//   - '-->' prevents premature end of an HTML comment wrapping the script
+//   - U+2028 / U+2029 are paragraph/line separators that JSON.stringify
+//     emits raw but ES <=2018 parses as newlines inside string literals,
+//     which would terminate the literal early
+// Today's inputs (validated appPath, URL pathname) cannot produce these,
+// but the cost of insulation is one regex pass.
 function jsLiteral(s: string): string {
-  return JSON.stringify(s).replace(/</g, '\\u003c')
+  // Avoid raw U+2028/U+2029 in regex literals (TS parses them as line
+  // terminators); use new RegExp with \u escapes inside a string instead.
+  const lineSep = new RegExp('[\\u2028\\u2029]', 'g')
+  return JSON.stringify(s)
+    .replace(/</g, '\\u003c')
+    .replace(/-->/g, '--\\u003e')
+    .replace(lineSep, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'))
 }
-
 function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): string {
   const prefix = jsLiteral(proxyPathPrefix)
   // Normalise: strip trailing slash; "/" becomes "" (no stripping needed).
@@ -620,15 +711,16 @@ interface ProxyPair {
 // Pipe an upstream response through to the client untouched (apart from
 // stripping hop-by-hop headers).  Centralised so the body-rewriting and
 // fall-through paths share the same header-handling and error semantics.
-function streamThrough(proxyRes: IncomingMessage, res: ServerResponse, status: number): void {
+function streamThrough(proxyRes: IncomingMessage, res: ServerResponse): void {
   const headers: Record<string, string | string[] | undefined> = { ...proxyRes.headers }
   for (const h of HOP_BY_HOP_HEADERS) {
     delete headers[h]
   }
-  res.writeHead(status, headers)
+  // Attach error handler BEFORE pipe so a synchronous error doesn't become
+  // an unhandled 'error' event.
   proxyRes.on('error', () => {
-    // Upstream errored mid-stream.  Headers are already sent so the best we
-    // can do is destroy the connection so the client knows the body is
+    // Upstream errored mid-stream.  Headers may already be sent so the best
+    // we can do is destroy the connection so the client knows the body is
     // truncated rather than receive a silently-incomplete payload.
     try {
       res.destroy()
@@ -636,6 +728,7 @@ function streamThrough(proxyRes: IncomingMessage, res: ServerResponse, status: n
       // already destroyed
     }
   })
+  res.writeHead(proxyRes.statusCode ?? 200, headers)
   proxyRes.pipe(res)
 }
 
@@ -651,17 +744,23 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
     description: 'General reverse proxy — embed any web application as a webapp in SignalK',
 
     start(config: object, _restart: (newConfiguration: object) => void): void {
-      // Remove any previous upgrade listener (handles plugin restart without an explicit stop)
+      // Tear down anything from a prior start() so request handlers don't
+      // observe a half-built state during the rebuild below. Flip `started`
+      // off FIRST so any concurrent request short-circuits at the gate
+      // instead of indexing into a mutating proxies array.
+      started = false
       if (upgradeHandler && app.server) {
         app.server.removeListener('upgrade', upgradeHandler)
         upgradeHandler = null
       }
+      proxies = []
+      currentApps = []
 
-      currentApps = parseConfig(config, (i, err) => {
+      const nextApps = parseConfig(config, (i, err) => {
         app.error(`Skipping app at config index ${i}: ${String(err)}`)
       })
 
-      proxies = currentApps.map((appConfig, appIndex) => {
+      const nextProxies: ProxyPair[] = nextApps.map((appConfig, appIndex) => {
         const proxyPathPrefix = `${PLUGIN_PATH_PREFIX}${PROXY_SUBPATH}/${appConfig.appPath || String(appIndex)}`
         // Compute the rewrite script once per app — its inputs are static for
         // the life of the plugin instance, so re-building it on every HTML
@@ -798,48 +897,76 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                       encoding === 'deflate' ||
                       encoding === 'br'
                     if (!knownEncoding) {
-                      streamThrough(proxyRes, res, status)
+                      app.error(
+                        `Skipping HTML rewrite for unknown content-encoding "${encoding}" — body streamed through unmodified`,
+                      )
+                      streamThrough(proxyRes, res)
                       return
                     }
-                    const stream: NodeJS.ReadableStream =
+                    let aborted = false
+                    const abort = (status502Body: string): void => {
+                      if (aborted) return
+                      aborted = true
+                      // Stop background reads on both legs (when there is no
+                      // decompressor, stream === proxyRes and the second
+                      // destroy() is a no-op).
+                      try {
+                        stream.destroy()
+                      } catch {
+                        // already destroyed
+                      }
+                      try {
+                        proxyRes.destroy()
+                      } catch {
+                        // already destroyed
+                      }
+                      if (!res.headersSent) {
+                        try {
+                          res.writeHead(502, { 'Content-Type': 'text/plain' })
+                        } catch {
+                          // headers raced to "sent"
+                        }
+                      }
+                      try {
+                        res.end(status502Body)
+                      } catch {
+                        // already ended
+                      }
+                    }
+                    // SECURITY: Bound decompressor output so a decompression-bomb
+                    // upstream cannot allocate gigabytes before our per-chunk
+                    // size check fires. Brotli supports a hard cap; for gzip/
+                    // deflate we rely on the per-chunk accumulator below.
+                    const stream: Readable =
                       encoding === 'gzip' || encoding === 'x-gzip'
                         ? proxyRes.pipe(createGunzip())
                         : encoding === 'deflate'
                           ? proxyRes.pipe(createInflate())
                           : encoding === 'br'
-                            ? proxyRes.pipe(createBrotliDecompress())
+                            ? proxyRes.pipe(
+                                createBrotliDecompress({
+                                  maxOutputLength: MAX_HTML_REWRITE_BYTES,
+                                }),
+                              )
                             : proxyRes
+                    // Attach error handlers BEFORE wiring `data`/`end` so that a
+                    // synchronous error on the source after `.pipe()` does not
+                    // become an unhandled 'error' event (process crash).
+                    proxyRes.on('error', () => abort('Bad Gateway: upstream error'))
+                    if (stream !== proxyRes) {
+                      stream.on('error', () => abort('Bad Gateway: decompression error'))
+                    }
                     const chunks: Buffer[] = []
                     let totalBytes = 0
-                    let aborted = false
                     stream.on('data', (chunk: Buffer) => {
                       if (aborted) return
-                      totalBytes += chunk.length
-                      if (totalBytes > MAX_HTML_REWRITE_BYTES) {
-                        // Response exceeds the rewrite cap. Once the decompressor
-                        // has consumed part of proxyRes the remaining compressed
-                        // bytes are mid-stream — forwarding them verbatim would
-                        // produce a corrupt response. Destroy both streams to
-                        // stop background reads, then send 502.
-                        aborted = true
-                        try {
-                          // NodeJS.ReadableStream lacks destroy() in its interface
-                          // but all concrete types (Gunzip, Inflate, etc.) have it.
-                          ;(stream as unknown as { destroy(): void }).destroy()
-                        } catch {
-                          // ignore — stream may already be destroyed
-                        }
-                        try {
-                          proxyRes.destroy()
-                        } catch {
-                          // ignore — same stream when no decompressor is used
-                        }
-                        if (!res.headersSent) {
-                          res.writeHead(502, { 'Content-Type': 'text/plain' })
-                          res.end('Bad Gateway: response too large to rewrite')
-                        }
+                      // Check the projected size BEFORE pushing so we cannot
+                      // briefly buffer 2× the cap with a single oversized chunk.
+                      if (totalBytes + chunk.length > MAX_HTML_REWRITE_BYTES) {
+                        abort('Bad Gateway: response too large to rewrite')
                         return
                       }
+                      totalBytes += chunk.length
                       chunks.push(chunk)
                     })
                     stream.on('end', () => {
@@ -875,33 +1002,11 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                       res.writeHead(status, headers)
                       res.end(buf)
                     })
-                    stream.on('error', () => {
-                      if (aborted) return
-                      if (!res.headersSent) {
-                        res.writeHead(502, { 'Content-Type': 'text/plain' })
-                      }
-                      res.end('Bad Gateway: decompression error')
-                    })
-                    // If the *source* stream errors after we've started
-                    // piping into a decoder, surface it to the same handler.
-                    proxyRes.on('error', () => {
-                      if (aborted || res.headersSent) return
-                      try {
-                        res.writeHead(502, { 'Content-Type': 'text/plain' })
-                      } catch {
-                        // headers already sent
-                      }
-                      try {
-                        res.end('Bad Gateway: upstream error')
-                      } catch {
-                        // already ended
-                      }
-                    })
                     return
                   }
                 }
 
-                streamThrough(proxyRes, res, status)
+                streamThrough(proxyRes, res)
               },
               error(err: Error, _req: IncomingMessage, res: ServerResponse | Socket): void {
                 app.error(`Web proxy error: ${err.message}`)
@@ -925,12 +1030,18 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
         }
       })
 
-      started = true
-
-      if (app.server && proxies.length > 0) {
+      if (app.server && nextProxies.length > 0) {
         // Forward WebSocket upgrades to the correct per-app proxy.
         // ws:false above means http-proxy-middleware does NOT auto-intercept
         // upgrades; we dispatch manually so only our plugin paths are affected.
+        //
+        // Capture nextApps/nextProxies in the closure rather than reading
+        // through the module-level `currentApps`/`proxies`. This way a
+        // subsequent start() (which mutates the module-level state before
+        // installing its own listener) cannot cause an in-flight upgrade
+        // already inside this handler to resolve against the wrong arrays.
+        const handlerApps = nextApps
+        const handlerProxies = nextProxies
         upgradeHandler = (req: IncomingMessage, socket: Socket, head: Buffer): void => {
           const prefix = `${PLUGIN_PATH_PREFIX}${PROXY_SUBPATH}/`
           if (!req.url?.startsWith(prefix)) return // not our path — ignore
@@ -945,12 +1056,12 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
           const queryString = queryIdx >= 0 ? rest.substring(queryIdx) : ''
           const slash = pathPart.indexOf('/')
           const appId = slash >= 0 ? pathPart.substring(0, slash) : pathPart
-          const index = resolveAppIndex(appId, currentApps)
-          if (index < 0 || index >= proxies.length) {
+          const index = resolveAppIndex(appId, handlerApps)
+          if (index < 0 || index >= handlerProxies.length) {
             reject404()
             return
           }
-          const pair = proxies[index]
+          const pair = handlerProxies[index]
           if (!pair) {
             reject404()
             return
@@ -977,16 +1088,25 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
         }
         app.server.on('upgrade', upgradeHandler)
       }
+
+      // Publish the new state only after the upgrade listener is wired so
+      // there is no window where started=true but no listener is attached.
+      currentApps = nextApps
+      proxies = nextProxies
+      started = true
     },
 
     stop(): void {
+      // Flip `started` off BEFORE clearing the arrays so any concurrent
+      // request short-circuits at the gate instead of indexing into an
+      // empty proxies array.
+      started = false
       if (upgradeHandler && app.server) {
         app.server.removeListener('upgrade', upgradeHandler)
       }
       upgradeHandler = null
       proxies = []
       currentApps = []
-      started = false
     },
 
     registerWithRouter(router: IRouter): void {
@@ -1005,7 +1125,10 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
       router.use(
         `${PROXY_SUBPATH}/:appId`,
         (req: Request, res: Response, next: () => void): void => {
-          stripInvalidHeaders(req as unknown as IncomingMessage)
+          // Express's Request extends http.IncomingMessage, so the cast-free
+          // call type-checks once the signature widens — but TS still wants
+          // an explicit narrowing because Request has extra methods.
+          stripInvalidHeaders(req)
           const rawAppId = req.params['appId']
           const appId = typeof rawAppId === 'string' ? rawAppId : (rawAppId?.[0] ?? '')
           if (!started) {
@@ -1031,11 +1154,9 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
             res.status(404).json({ error: `No app found for "${appId}"` })
             return
           }
-          ;(proxy as unknown as (req: Request, res: Response, next: () => void) => void)(
-            req,
-            res,
-            next,
-          )
+          // http-proxy-middleware v3 RequestHandler returns a Promise; fire
+          // and forget — errors land in the `error` hook configured above.
+          void proxy(req, res, next)
         },
       )
     },

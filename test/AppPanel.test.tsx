@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import '@testing-library/jest-dom'
 import AppPanel from '../src/components/AppPanel'
 
@@ -389,6 +389,101 @@ describe('AppPanel', () => {
         '/plugins/signalk-embedded-webapp-proxy/apps',
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
+    })
+
+    it('aborts the in-flight fetch when unmounted before it resolves', () => {
+      // Captures the AbortSignal passed to fetch so we can verify the
+      // cleanup hook actually calls abort() on unmount — this exercises
+      // the controller.abort() return value of the useEffect, which is
+      // otherwise unobservable.
+      let capturedSignal: AbortSignal | undefined
+      global.fetch = jest.fn().mockImplementation((_url: string, opts: { signal: AbortSignal }) => {
+        capturedSignal = opts.signal
+        return new Promise(() => {
+          /* never resolves */
+        })
+      })
+      const { unmount } = render(<AppPanel />)
+      expect(capturedSignal).toBeDefined()
+      expect(capturedSignal?.aborted).toBe(false)
+      unmount()
+      expect(capturedSignal?.aborted).toBe(true)
+    })
+  })
+
+  describe('accessibility', () => {
+    const twoApps: AppInfo[] = [
+      { index: 0, name: 'Portainer CE' },
+      { index: 1, name: 'Grafana' },
+    ]
+
+    it('keyboard focus into the toolbar reveals it after auto-hide', async () => {
+      // Documented behaviour: keyboard users tabbing into the panel reveal
+      // the toolbar via the focusin handler on the toolbar div. Without
+      // this, AT users can never reach the hidden combobox.
+      mockFetchApps(twoApps)
+      render(<AppPanel />)
+      const select = await screen.findByRole('combobox')
+
+      act(() => {
+        fireEvent.change(select, { target: { value: '0' } })
+      })
+      act(() => {
+        jest.advanceTimersByTime(3000)
+      })
+      // Sanity: toolbar is hidden.
+      expect(screen.getByTestId('toolbar')).toHaveStyle({ top: '-40px' })
+
+      // Focusing into the toolbar reveals it.
+      act(() => {
+        fireEvent.focus(screen.getByTestId('toolbar'))
+      })
+      await waitFor(() => expect(screen.getByTestId('toolbar')).toHaveStyle({ top: '0px' }))
+    })
+
+    it('hot zone is hidden from assistive technology', async () => {
+      mockFetchApps(twoApps)
+      render(<AppPanel />)
+      const select = await screen.findByRole('combobox')
+      act(() => {
+        fireEvent.change(select, { target: { value: '0' } })
+      })
+      act(() => {
+        jest.advanceTimersByTime(3000)
+      })
+      expect(screen.getByTestId('hot-zone')).toHaveAttribute('aria-hidden', 'true')
+    })
+
+    it('blur with relatedTarget inside the toolbar does not start a new hide timer', async () => {
+      // UX: blur whose relatedTarget is still inside the toolbar must not
+      // re-schedule a hide — otherwise focus moving between sibling controls
+      // within the toolbar would race the user's interaction.
+      mockFetchApps(twoApps)
+      render(<AppPanel />)
+      const select = await screen.findByRole('combobox')
+      act(() => {
+        fireEvent.change(select, { target: { value: '0' } })
+      })
+      const toolbar = screen.getByTestId('toolbar')
+      // Cancel the timer that the select-change started by mouse-entering
+      // the toolbar — this puts us in a known no-pending-timer state.
+      act(() => {
+        fireEvent.mouseEnter(toolbar)
+      })
+      act(() => {
+        jest.advanceTimersByTime(10000)
+      })
+      expect(toolbar).toHaveStyle({ top: '0px' })
+
+      // Now fire blur whose relatedTarget is the select inside the toolbar.
+      // The guard short-circuits scheduleHide, so no new timer starts.
+      act(() => {
+        fireEvent.blur(toolbar, { relatedTarget: select })
+      })
+      act(() => {
+        jest.advanceTimersByTime(10000)
+      })
+      expect(toolbar).toHaveStyle({ top: '0px' })
     })
   })
 })

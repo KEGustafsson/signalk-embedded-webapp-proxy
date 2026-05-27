@@ -279,6 +279,24 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(mockCreateProxyMiddleware).toHaveBeenCalledTimes(16)
     })
 
+    it('logs an error for each app dropped past MAX_APP_SLOTS', () => {
+      // Silent truncation is a footgun — an operator who configures the 17th
+      // app must get a signal in the log instead of wondering why it's not
+      // reachable.
+      const manyApps = Array.from({ length: 18 }, (_, i) => ({
+        name: `App ${i}`,
+        url: `http://localhost:${9000 + i}`,
+      }))
+      plugin.start({ apps: manyApps }, jest.fn())
+
+      const dropMessages = mockError.mock.calls
+        .map((c) => (c[0] as string) ?? '')
+        .filter((m) => m.includes('MAX_APP_SLOTS'))
+      expect(dropMessages).toHaveLength(2) // apps at index 16 and 17
+      expect(dropMessages[0]).toContain('index 16')
+      expect(dropMessages[1]).toContain('index 17')
+    })
+
     it('uses https scheme when URL uses https', () => {
       plugin.start(oneApp({ url: 'https://localhost:9443' }), jest.fn())
 
@@ -365,7 +383,10 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(calls.find(([k]) => k === 'Accept-Encoding')).toBeUndefined()
     })
 
-    it('appends to existing X-Forwarded-For header', () => {
+    it('overwrites a client-supplied X-Forwarded-For with the observed remote address', () => {
+      // SECURITY: appending to the client-supplied chain would let the caller
+      // spoof the "real" IP that upstream apps trust from the leftmost entry.
+      // The proxy only emits what it has actually observed.
       mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
 
       plugin.start(oneApp(), jest.fn())
@@ -375,14 +396,30 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const mockProxyReq = { setHeader: jest.fn() }
       const mockReq = {
         socket: { remoteAddress: '10.0.0.2', encrypted: true },
-        headers: { 'x-forwarded-for': '192.168.1.1' },
+        headers: { 'x-forwarded-for': '192.168.1.1, evil' },
       }
 
       proxyReqHandler(mockProxyReq, mockReq)
 
       const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
       const headerMap = Object.fromEntries(setCalls.map(([k, v]) => [k, v]))
-      expect(headerMap['X-Forwarded-For']).toBe('192.168.1.1, 10.0.0.2')
+      expect(headerMap['X-Forwarded-For']).toBe('10.0.0.2')
+      expect(headerMap['X-Forwarded-Proto']).toBe('https')
+    })
+
+    it('rejects garbage X-Forwarded-Proto values and falls back to default proto', () => {
+      mockCreateProxyMiddleware.mockReturnValue(jest.fn() as unknown as MockProxyMiddleware)
+      plugin.start(oneApp(), jest.fn())
+      const proxyReqHandler = extractProxyReqHandler()
+
+      const mockProxyReq = { setHeader: jest.fn() }
+      proxyReqHandler(mockProxyReq, {
+        socket: { remoteAddress: '10.0.0.3', encrypted: true },
+        headers: { 'x-forwarded-proto': 'javascript:alert(1)' },
+      })
+      const headerMap = Object.fromEntries(
+        (mockProxyReq.setHeader.mock.calls as [string, string][]).map(([k, v]) => [k, v]),
+      )
       expect(headerMap['X-Forwarded-Proto']).toBe('https')
     })
 
@@ -950,6 +987,78 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
 
       expect(mockRes.status).toHaveBeenCalledWith(503)
     })
+
+    it('HTTP /__root__ dispatch routes to pair.root, not pair.main', () => {
+      // When the app has a base path AND rewritePaths is enabled, the plugin
+      // creates a second host-only proxy. /__root__/<path> requests must be
+      // stripped of the marker and dispatched to that second proxy so the
+      // request hits the upstream host's root, not its base path.
+      const mainProxy: MockProxyMiddleware = jest.fn()
+      const rootProxy: MockProxyMiddleware = jest.fn()
+      // First call → main (with rewrite enabled), second call → root (host-only)
+      mockCreateProxyMiddleware.mockReturnValueOnce(mainProxy).mockReturnValueOnce(rootProxy)
+
+      plugin.start(
+        {
+          apps: [
+            {
+              name: 'Grafana',
+              url: 'http://localhost:3000/grafana',
+              rewritePaths: true,
+              appPath: 'grafana',
+            },
+          ],
+        },
+        jest.fn(),
+      )
+      plugin.registerWithRouter!(mockRouter)
+
+      const handler = registeredHandlers.get('/proxy/:appId')!
+      const mockReq = {
+        params: { appId: 'grafana' },
+        url: '/__root__/plugins/some-other/ws',
+        headers: {},
+      } as unknown as Request
+      const mockRes = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn().mockReturnThis(),
+      } as unknown as Response
+      const mockNext = jest.fn()
+
+      handler(mockReq, mockRes, mockNext)
+
+      // The root proxy received the call with the __root__ marker stripped.
+      expect(rootProxy).toHaveBeenCalledTimes(1)
+      expect(mainProxy).not.toHaveBeenCalled()
+      expect(mockReq.url).toBe('/plugins/some-other/ws')
+    })
+
+    it('HTTP /__root__ on an app without a root pair returns 404', () => {
+      // When path is '/' or rewritePaths is false, no root pair is created.
+      // A /__root__ URL targeting such an app must 404 rather than fall back
+      // to the main proxy with a stripped marker that would silently misroute.
+      const mainProxy: MockProxyMiddleware = jest.fn()
+      mockCreateProxyMiddleware.mockReturnValue(mainProxy)
+
+      plugin.start({ apps: [{ name: 'A', url: 'http://localhost:9000' }] }, jest.fn())
+      plugin.registerWithRouter!(mockRouter)
+
+      const handler = registeredHandlers.get('/proxy/:appId')!
+      const mockReq = {
+        params: { appId: '0' },
+        url: '/__root__/anything',
+        headers: {},
+      } as unknown as Request
+      const mockRes = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn().mockReturnThis(),
+      } as unknown as Response
+      const mockNext = jest.fn()
+
+      handler(mockReq, mockRes, mockNext)
+      expect(mockRes.status).toHaveBeenCalledWith(404)
+      expect(mainProxy).not.toHaveBeenCalled()
+    })
   })
 
   describe('WebSocket upgrade header rewriting (proxyReqWs)', () => {
@@ -1035,19 +1144,20 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(setCalls.find(([k]) => k === 'Origin')).toBeUndefined()
     })
 
-    it('appends the client IP to an existing X-Forwarded-For on upgrade', () => {
+    it('overwrites a client-supplied X-Forwarded-For with the observed remote address on upgrade', () => {
+      // Same protection as the HTTP path — see the proxyReq sibling test.
       plugin.start(oneApp(), jest.fn())
 
       const proxyReqWs = extractProxyReqWsHandler()
       const mockProxyReq = { setHeader: jest.fn() }
       proxyReqWs(mockProxyReq, {
         socket: { remoteAddress: '10.0.0.12' },
-        headers: { 'x-forwarded-for': '192.168.1.1' },
+        headers: { 'x-forwarded-for': '192.168.1.1, evil' },
       })
 
       const setCalls = mockProxyReq.setHeader.mock.calls as [string, string][]
       const headerMap = Object.fromEntries(setCalls.map(([k, v]) => [k, v]))
-      expect(headerMap['X-Forwarded-For']).toBe('192.168.1.1, 10.0.0.12')
+      expect(headerMap['X-Forwarded-For']).toBe('10.0.0.12')
     })
   })
 
@@ -1324,6 +1434,109 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       plugin.start(oneApp(), jest.fn())
       expect(mockServer.listenerCount('upgrade')).toBe(1)
     })
+
+    it('WS /__root__ dispatch routes to pair.root, not pair.main', () => {
+      // Mirror of the HTTP test: when an app has a base path AND
+      // rewritePaths is true, /__root__/<path> WebSocket upgrades must reach
+      // the host-only proxy with the marker stripped.
+      const mainProxy: MockProxyMiddleware = jest.fn()
+      mainProxy.upgrade = jest.fn()
+      const rootProxy: MockProxyMiddleware = jest.fn()
+      rootProxy.upgrade = jest.fn()
+      mockCreateProxyMiddleware.mockReturnValueOnce(mainProxy).mockReturnValueOnce(rootProxy)
+
+      const plugin = pluginFactory(appWithServer)
+      plugin.start(
+        {
+          apps: [
+            {
+              name: 'Grafana',
+              url: 'http://localhost:3000/grafana',
+              rewritePaths: true,
+              appPath: 'grafana',
+            },
+          ],
+        },
+        jest.fn(),
+      )
+
+      const mockReq = {
+        url: '/plugins/signalk-embedded-webapp-proxy/proxy/grafana/__root__/plugins/some-other/ws',
+        headers: {},
+      } as unknown as IncomingMessage
+      const mockSocket = { write: jest.fn(), end: jest.fn() } as unknown as Socket
+      const mockHead = Buffer.alloc(0)
+
+      mockServer.emit('upgrade', mockReq, mockSocket, mockHead)
+
+      expect(rootProxy.upgrade).toHaveBeenCalledTimes(1)
+      expect(mainProxy.upgrade).not.toHaveBeenCalled()
+      expect(mockReq.url).toBe('/plugins/some-other/ws')
+    })
+
+    it('WS /__root__ on an app without a root pair returns 404', () => {
+      // Same defensive check as the HTTP test: a /__root__ URL targeting
+      // an app where no host-only proxy was created must not fall through
+      // to the main proxy.
+      const mainProxy: MockProxyMiddleware = jest.fn()
+      mainProxy.upgrade = jest.fn()
+      mockCreateProxyMiddleware.mockReturnValue(mainProxy)
+
+      const plugin = pluginFactory(appWithServer)
+      plugin.start(oneApp(), jest.fn())
+
+      const mockReq = {
+        url: '/plugins/signalk-embedded-webapp-proxy/proxy/0/__root__/anything',
+        headers: {},
+      } as unknown as IncomingMessage
+      const mockSocket = { write: jest.fn(), end: jest.fn() } as unknown as Socket
+      const mockHead = Buffer.alloc(0)
+
+      mockServer.emit('upgrade', mockReq, mockSocket, mockHead)
+
+      const sockAny = mockSocket as unknown as { write: jest.Mock; end: jest.Mock }
+      expect(mainProxy.upgrade).not.toHaveBeenCalled()
+      expect(sockAny.write).toHaveBeenCalledWith(
+        'HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n',
+      )
+    })
+
+    it('upgrade handler from previous start does not observe new-config state', () => {
+      // Lifecycle invariant: each start() captures its proxies/apps in a
+      // closure-local snapshot. If we kept the old listener installed (we
+      // don't — the rebuild removes it) but somehow re-fired it after a
+      // second start(), it would still resolve against the original arrays
+      // it was built for, not the freshly-installed state.
+      const firstProxy: MockProxyMiddleware = jest.fn()
+      firstProxy.upgrade = jest.fn()
+      const secondProxy: MockProxyMiddleware = jest.fn()
+      secondProxy.upgrade = jest.fn()
+      mockCreateProxyMiddleware.mockReturnValueOnce(firstProxy).mockReturnValueOnce(secondProxy)
+
+      const plugin = pluginFactory(appWithServer)
+      plugin.start({ apps: [{ name: 'A', url: 'http://host-a:8080' }] }, jest.fn())
+      const firstHandler = mockServer.listeners('upgrade')[0] as (
+        req: IncomingMessage,
+        s: Socket,
+        h: Buffer,
+      ) => void
+
+      // Second start with a DIFFERENT app at index 0
+      plugin.start({ apps: [{ name: 'B', url: 'http://host-b:8080' }] }, jest.fn())
+
+      // Fire the first listener manually (simulates a request that landed
+      // mid-restart). It should still dispatch to the proxies captured at
+      // its build time — i.e. firstProxy — not the newly-installed ones.
+      const mockReq = {
+        url: '/plugins/signalk-embedded-webapp-proxy/proxy/0/ws',
+        headers: {},
+      } as unknown as IncomingMessage
+      const mockSocket = { write: jest.fn(), end: jest.fn() } as unknown as Socket
+      firstHandler(mockReq, mockSocket, Buffer.alloc(0))
+
+      expect(firstProxy.upgrade).toHaveBeenCalledTimes(1)
+      expect(secondProxy.upgrade).not.toHaveBeenCalled()
+    })
   })
 
   describe('proxy error handling', () => {
@@ -1555,6 +1768,28 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(body.toString()).toContain(
         '<script data-signalk-embedded-webapp-proxy="path-rewrite">',
       )
+    })
+
+    it('injected script body contains no raw "</" that could prematurely terminate the script tag', async () => {
+      // SECURITY: jsLiteral escapes '<' to < specifically so a JSON-
+      // stringified literal embedded inside <script>…</script> cannot break
+      // out. With current validated inputs no '<' is reachable, but the
+      // escape is preventative — any future regression that fed an
+      // attacker-controlled string through unescaped would land here.
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
+      const html = body.toString()
+      const m = html.match(
+        /<script data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/,
+      )
+      expect(m).not.toBeNull()
+      const scriptBody = m![1]!
+      // The script body itself must not contain "</" — that's the only
+      // sequence the HTML tokenizer treats as a script-end-tag-open. The
+      // literal substring "<" is allowed (e.g. inside regexes).
+      expect(scriptBody).not.toMatch(/<\//)
     })
 
     it('rewrites WebSocket URLs (absolute ws:// to current host and root-relative paths)', async () => {
@@ -2248,6 +2483,115 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(cookies[1]).toContain('Path=/plugins/signalk-embedded-webapp-proxy/proxy/0/api')
       // Domain attribute is dropped — cookie is set on the SignalK origin.
       expect(cookies[1]).not.toMatch(/Domain=/i)
+    })
+
+    it('respects quoted cookie-values when splitting attributes', async () => {
+      // SECURITY: a malicious upstream could embed `;Path=/escape` inside a
+      // quoted cookie-value to inject a fake Path attribute that shadows the
+      // real one. The splitter must honour the quotes so the injected text
+      // stays inside the value.
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      const headers: Record<string, string | string[]> = {
+        'content-type': 'application/json',
+        'set-cookie': ['data="a;Path=/escape;b"; Path=/api; HttpOnly'],
+      }
+      Object.assign(proxyResStream, { headers, statusCode: 200 })
+      const { res } = makeWritableRes()
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
+      proxyResStream.end()
+      await new Promise((r) => res.on('finish', r))
+
+      const cookies = headers['set-cookie'] as string[]
+      // The real Path=/api is what gets rewritten — the injected Path inside
+      // the quoted value must not be promoted to an attribute.
+      expect(cookies[0]).toContain('Path=/plugins/signalk-embedded-webapp-proxy/proxy/0/api')
+      // The injected value remains harmlessly inside the cookie-value.
+      expect(cookies[0]).toContain('data="a;Path=/escape;b"')
+      // And the bogus Path was not rewritten to the proxy prefix.
+      expect(cookies[0]).not.toContain('Path=/plugins/signalk-embedded-webapp-proxy/proxy/0/escape')
+    })
+
+    it('rewrites a cookie Path scoped to a sibling plugin/app prefix', async () => {
+      // SECURITY: an upstream that sets Path scoped to the plugin's parent
+      // namespace (or a sibling app's prefix) would have the browser send
+      // that cookie to other apps in the plugin. The rewriter detects any
+      // path outside this app's proxy subtree and re-scopes it.
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      const headers: Record<string, string | string[]> = {
+        'content-type': 'application/json',
+        'set-cookie': [
+          // Targets the parent plugin prefix
+          'leak=x; Path=/plugins/signalk-embedded-webapp-proxy/',
+        ],
+      }
+      Object.assign(proxyResStream, { headers, statusCode: 200 })
+      const { res } = makeWritableRes()
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
+      proxyResStream.end()
+      await new Promise((r) => res.on('finish', r))
+
+      const cookies = headers['set-cookie'] as string[]
+      // The cookie was scoped under this app's prefix, not left at the parent
+      // plugin prefix where every sibling proxied app would receive it.
+      expect(cookies[0]).not.toMatch(/Path=\/plugins\/signalk-embedded-webapp-proxy\/$/)
+      expect(cookies[0]).toContain('Path=/plugins/signalk-embedded-webapp-proxy/proxy/0/')
+    })
+
+    it('leaves a cookie Path already scoped to this app untouched', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      const headers: Record<string, string | string[]> = {
+        'content-type': 'application/json',
+        'set-cookie': ['s=1; Path=/plugins/signalk-embedded-webapp-proxy/proxy/0/sub'],
+      }
+      Object.assign(proxyResStream, { headers, statusCode: 200 })
+      const { res } = makeWritableRes()
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
+      proxyResStream.end()
+      await new Promise((r) => res.on('finish', r))
+
+      const cookies = headers['set-cookie'] as string[]
+      // No double-prefixing.
+      expect(cookies[0]).toContain('Path=/plugins/signalk-embedded-webapp-proxy/proxy/0/sub')
+      expect(cookies[0]).not.toContain('proxy/0/plugins/signalk-embedded-webapp-proxy')
+    })
+
+    it('drops duplicate Path attributes after the first', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      const headers: Record<string, string | string[]> = {
+        'content-type': 'application/json',
+        'set-cookie': ['t=1; Path=/api; Path=/escape; HttpOnly'],
+      }
+      Object.assign(proxyResStream, { headers, statusCode: 200 })
+      const { res } = makeWritableRes()
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
+      proxyResStream.end()
+      await new Promise((r) => res.on('finish', r))
+
+      const cookies = headers['set-cookie'] as string[]
+      expect(cookies[0]).toContain('Path=/plugins/signalk-embedded-webapp-proxy/proxy/0/api')
+      // The second Path was dropped — no /escape leak.
+      expect(cookies[0]).not.toContain('/escape')
+      expect(cookies[0]).toContain('HttpOnly')
     })
 
     it('strips Content-Security-Policy headers when rewritePaths is enabled', async () => {

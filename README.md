@@ -7,7 +7,7 @@ Configure one or more applications (Portainer CE, Grafana, Node-RED, etc.). A se
 ## Prerequisites
 
 - [SignalK server](https://github.com/SignalK/signalk-server) (v2.x or later)
-- Node.js >= 18
+- Node.js >= 20
 - The web applications you want to embed, accessible from the SignalK host
 
 ## Installation
@@ -41,7 +41,7 @@ After installation, configure the plugin in the SignalK admin UI:
 | Field                              | Description                                                                          | Default              |
 | ---------------------------------- | ------------------------------------------------------------------------------------ | -------------------- |
 | **Name**                           | Display name shown in the app selector                                               | `My App`             |
-| **Proxy Path**                     | Custom path identifier (e.g. `portainer`). When set, the app is also accessible at `/plugins/signalk-embedded-webapp-proxy/proxy/<appPath>`. Must start with a letter; only letters, digits, and hyphens allowed. | _(none)_ |
+| **Proxy Path**                     | Custom path identifier (e.g. `portainer`). When set, the app is also accessible at `/plugins/signalk-embedded-webapp-proxy/proxy/<appPath>`. Must start with a letter; only letters, digits, and hyphens allowed. Values are normalised to lowercase, so `Portainer` and `portainer` resolve to the same path; configuring two apps that differ only in case is rejected. | _(none)_ |
 | **Application URL**                | URL with protocol and host required; port is optional (defaults to `80` for http, `443` for https); base path is optional — e.g. `http://192.168.1.100:9000`, `https://myapp.local/admin` | `http://127.0.0.1` |
 | **Allow Self-Signed Certificates** | Accept self-signed TLS certs (HTTPS only)                                            | `false`              |
 | **Rewrite Absolute Paths**         | Inject a script into HTML responses that rewrites absolute API paths (e.g. `/api/auth`) so they route through the proxy. Enable for SPAs like Portainer or Grafana — eliminates the need for `--base-url` on the target container. | `false` |
@@ -126,7 +126,7 @@ docker run -d \
   -p 3001:3000 \
   --name grafana \
   --restart=always \
-  -e GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana/" \
+  -e GF_SERVER_ROOT_URL="%(protocol)s://%(domain)s/grafana/" \
   grafana/grafana
 ```
 
@@ -175,9 +175,19 @@ docker run -d \
 ## Security considerations
 
 - **Only proxy trusted internal applications.** The plugin performs no authentication of its own; any app reachable at the configured host:port will be forwarded to anyone with access to the SignalK UI.
-- **iframe same-origin access.** The embedded iframe uses `allow-same-origin` in its sandbox so that cookie and session-based authentication works in proxied apps (e.g. Portainer). This means proxied content runs at the SignalK admin origin and can access admin-origin cookies. Only configure apps you fully trust.
+- **iframe same-origin access.** The embedded iframe uses `allow-same-origin` in its sandbox so that cookie and session-based authentication works in proxied apps (e.g. Portainer). This means proxied content runs at the SignalK admin origin and can read admin-origin cookies, `localStorage`, and `sessionStorage`. Only configure apps you fully trust.
 - **Port is optional.** If omitted from the URL, the port defaults to `80` for `http` and `443` for `https`. An invalid host causes the app entry to be skipped and logged via `app.error`.
-- **Cloud metadata endpoints are blocked.** Hosts `169.254.169.254` and `metadata.google.internal` (and case/dot variants) are rejected to prevent SSRF against cloud instance metadata APIs.
+- **Cloud metadata endpoints are blocked.** The following hosts (and case/dot variants) are rejected at config-validation time to prevent SSRF against cloud instance metadata APIs:
+  - `169.254.169.254` (AWS, GCP, OpenStack, DigitalOcean)
+  - `metadata.google.internal` (GCP)
+  - `100.100.100.200` (Alibaba Cloud)
+  - `192.0.0.192` (Oracle Cloud)
+  - `168.63.129.16` (Azure wireserver)
+
+  DNS rebinding (a configured hostname later resolving to one of these IPs) is not addressed — restrict the plugin to trusted internal apps.
+- **Status line discloses upstream hosts.** The plugin's status message in the SignalK admin UI lists every configured `scheme://host:port` so admins can verify their config. This means internal hostnames are visible to anyone with SignalK admin access.
+- **Maximum 16 apps.** Configurations with more than 16 apps have the overflow silently dropped (with an error log per dropped entry); add a smaller second instance of the plugin if you need more.
+- **Client-supplied `X-Forwarded-*` headers are not preserved.** The plugin overwrites `X-Forwarded-For` with the directly-observed remote address and accepts only `http`/`https`/`ws`/`wss` for `X-Forwarded-Proto`. Do not deploy this plugin behind another reverse proxy that you expect to extend a forwarded chain through to upstream apps.
 
 ## Troubleshooting
 

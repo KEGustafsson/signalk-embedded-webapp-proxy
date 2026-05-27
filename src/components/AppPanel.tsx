@@ -163,7 +163,14 @@ const AppPanel: React.FC = () => {
             onMouseEnter={clearHideTimer}
             onMouseLeave={scheduleHide}
             onFocus={revealToolbar}
-            onBlur={scheduleHide}
+            onBlur={(e) => {
+              // Only schedule a hide when focus genuinely leaves the toolbar.
+              // Without this guard, blurring from the <select> to any sibling
+              // inside the same toolbar (none today, but trivial to add later)
+              // would start the hide timer while the user is still interacting.
+              if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
+              scheduleHide()
+            }}
           >
             <select
               value={selected ?? ''}
