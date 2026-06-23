@@ -176,6 +176,8 @@ docker run -d \
 
 - **Only proxy trusted internal applications.** The plugin performs no authentication of its own; any app reachable at the configured host:port will be forwarded to anyone with access to the SignalK UI.
 - **iframe same-origin access.** The embedded iframe uses `allow-same-origin` in its sandbox so that cookie and session-based authentication works in proxied apps (e.g. Portainer). This means proxied content runs at the SignalK admin origin and can read admin-origin cookies, `localStorage`, and `sessionStorage`. Only configure apps you fully trust.
+- **Content-Security-Policy is preserved, not stripped.** When `rewritePaths` is enabled, the proxy injects a small inline script into HTML responses. Rather than deleting the upstream app's `Content-Security-Policy` (which would also remove the app's own XSS containment), the proxy adds a per-response `nonce` to the policy's `script-src` and tags the injected script with the same nonce. A policy that already allows inline scripts via `'unsafe-inline'` is left untouched. Note: a CSP delivered via an in-page `<meta>` tag is not modified — if such an app fails to run with `rewritePaths`, configure it without `rewritePaths` (see below).
+- **Stable numeric indices.** If one app entry fails validation, the remaining apps keep their original positional index (`/proxy/2/` stays `/proxy/2/` even if the app at index 1 was rejected) rather than silently shifting. For URLs that must survive config edits, prefer a custom **Proxy Path** (`appPath`) over the numeric index.
 - **Port is optional.** If omitted from the URL, the port defaults to `80` for `http` and `443` for `https`. An invalid host causes the app entry to be skipped and logged via `app.error`.
 - **Cloud metadata endpoints are blocked.** The following hosts (and case/dot variants) are rejected at config-validation time to prevent SSRF against cloud instance metadata APIs:
   - `169.254.169.254` (AWS, GCP, OpenStack, DigitalOcean)
@@ -188,6 +190,21 @@ docker run -d \
 - **Status line discloses upstream hosts.** The plugin's status message in the SignalK admin UI lists every configured `scheme://host:port` so admins can verify their config. This means internal hostnames are visible to anyone with SignalK admin access.
 - **Maximum 16 apps.** Configurations with more than 16 apps have the overflow silently dropped (with an error log per dropped entry); add a smaller second instance of the plugin if you need more.
 - **Client-supplied `X-Forwarded-*` headers are not preserved.** The plugin overwrites `X-Forwarded-For` with the directly-observed remote address and accepts only `http`/`https`/`ws`/`wss` for `X-Forwarded-Proto`. Do not deploy this plugin behind another reverse proxy that you expect to extend a forwarded chain through to upstream apps.
+- **WebSocket support needs `app.server`.** WebSocket upgrades are proxied only when the SignalK server exposes its underlying HTTP server to the plugin. If it doesn't, HTTP proxying still works but WebSocket-dependent features (e.g. Portainer container console, Node-RED) won't; the plugin logs a warning and the status line shows _"WebSocket support unavailable"_.
+
+## Supported applications and limitations
+
+This plugin serves an app at a sub-path it doesn't natively know about (`/plugins/signalk-embedded-webapp-proxy/proxy/<app>/`) by rewriting HTML/headers and injecting a runtime script that reroutes absolute paths. This works well for server-rendered apps and classic SPAs (Portainer, Grafana, Node-RED), but the technique cannot intercept everything. With `rewritePaths` enabled, the following are **not** rewritten and may not work:
+
+- **Service Workers** and code running in **Web Workers / Worklets** (the runtime patches only apply to the page context).
+- **WebAssembly** fetches and **static ES module imports / `<script type="importmap">`** (resolved by the HTML parser, not a patchable JS API).
+- **Subresource Integrity (`integrity=`)** assets and **`<meta>`-tag CSP** (modifying surrounding bytes or the absence of the header-CSP nonce can cause rejection).
+- **Hard-coded absolute origins** (`https://my-host:3000/api`) — only same-host absolute URLs are rewritten.
+- **Shadow DOM** subtrees (the MutationObserver does not pierce shadow roots).
+- **Non-UTF-8 HTML.** Responses declaring a charset other than UTF-8/ASCII are streamed through unmodified (no script injection) to avoid corrupting their bytes.
+- **`__Host-` cookies** keep `Path=/` (the prefix forbids any other path), so they are scoped to the whole SignalK origin rather than to the app's proxy subtree.
+
+**Preferred approach where supported:** if the upstream app can be told its base path natively — Grafana `serve_from_sub_path` + `root_url`, Node-RED `httpRoot`, etc. — configure it that way and leave `rewritePaths` **off**. Native base-path support is strictly more robust than path rewriting (none of the limitations above apply). Use `rewritePaths` as the zero-config fallback for apps that can't be reconfigured.
 
 ## Troubleshooting
 
