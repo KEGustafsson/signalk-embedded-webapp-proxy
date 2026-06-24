@@ -101,6 +101,11 @@ const ROOT_ESCAPE = '/__root__'
 // embedded apps with sub-path APIs (e.g. Grafana /api/...) keep working.
 const ROOT_NAMESPACES = ['/plugins/', '/signalk/', '/admin/', '/skServer/']
 
+/**
+ * True when `path` is a SignalK server root namespace (`/plugins/`, `/signalk/`,
+ * `/admin/`, `/skServer/`) that an embedded app may need to reach via the
+ * host-only proxy — excluding this plugin's own prefix.
+ */
 function isRootNamespace(path: string): boolean {
   // Never escape paths that already belong to this plugin — preserves routing
   // between sibling apps configured on the same plugin instance.
@@ -339,6 +344,10 @@ function rewriteHtmlAttributes(html: string, proxyPathPrefix: string, appBasePat
   return out
 }
 
+/**
+ * Delete any request header whose name is not a valid HTTP token, so a malformed
+ * header cannot smuggle past the proxy into the upstream request.
+ */
 function stripInvalidHeaders(req: IncomingMessage): void {
   if (!req.headers) return
   for (const key of Object.keys(req.headers)) {
@@ -348,10 +357,12 @@ function stripInvalidHeaders(req: IncomingMessage): void {
   }
 }
 
+/** Canonicalise a hostname for comparison: trim, lowercase, and strip trailing dots. */
 function normalizeHost(host: string): string {
   return host.trim().toLowerCase().replace(/\.+$/, '')
 }
 
+/** Validate a hostname: permitted characters only, and not a known cloud-metadata endpoint. */
 function isValidHost(host: string): boolean {
   const normalized = normalizeHost(host)
   if (!HOST_PATTERN.test(normalized)) return false
@@ -359,6 +370,7 @@ function isValidHost(host: string): boolean {
   return true
 }
 
+/** Build the upstream target URL (scheme://host:port + base path) for an app's main proxy. */
 function buildTarget(appConfig: AppConfig): string {
   // Strip trailing slash from path so node-http-proxy doesn't produce double-slashes.
   // A root path '/' becomes '' so the target is scheme://host:port with no path suffix.
@@ -366,6 +378,7 @@ function buildTarget(appConfig: AppConfig): string {
   return `${appConfig.scheme}://${appConfig.host}:${String(appConfig.port)}${path}`
 }
 
+/** Build the host-only upstream target (no base path) used for `/__root__`-escaped requests. */
 function buildRootTarget(appConfig: AppConfig): string {
   // Host-only target for root-escaped requests (e.g. /plugins/<other>/ws calls
   // from within a path-scoped proxied webapp).
@@ -470,6 +483,10 @@ function rewriteOriginHeader(
   }
 }
 
+/**
+ * Validate and normalise one raw app-config entry into an {@link AppConfig}.
+ * Throws if the entry is invalid (missing/blocked URL, scheme, host, appPath, timeout).
+ */
 function parseAppConfig(raw: Record<string, unknown>, index: number): AppConfig {
   const rawUrl = typeof raw['url'] === 'string' ? raw['url'].trim() : ''
   if (rawUrl.length === 0) {
@@ -554,6 +571,11 @@ function parseAppConfig(raw: Record<string, unknown>, index: number): AppConfig 
   }
 }
 
+/**
+ * Parse the plugin configuration into a position-stable array of app slots. Each
+ * slot is an {@link AppConfig}, or `null` when that config entry failed validation
+ * — the null placeholders keep the surviving apps' numeric indices stable.
+ */
 function parseConfig(
   config: object,
   onSkip: (index: number, err: unknown) => void,
@@ -602,6 +624,10 @@ function parseConfig(
   return results
 }
 
+/**
+ * Resolve a proxy path segment — a canonical numeric index or a custom appPath —
+ * to its app index, or -1 when unknown, out of range, or a null placeholder slot.
+ */
 function resolveAppIndex(appId: string, apps: (AppConfig | null)[]): number {
   if (/^\d+$/.test(appId)) {
     // Reject non-canonical numeric forms (e.g. "00", "01") so the URL space
@@ -648,6 +674,11 @@ function jsLiteral(s: string): string {
     .replace(/-->/g, '--\\u003e')
     .replace(lineSep, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'))
 }
+/**
+ * Build the inline `<script>` injected into HTML responses (when rewritePaths is
+ * enabled) that patches fetch/XHR/WebSocket/history/location and the DOM so the
+ * app's absolute paths route through the proxy. See the block comment above for detail.
+ */
 function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): string {
   const prefix = jsLiteral(proxyPathPrefix)
   // Normalise: strip trailing slash; "/" becomes "" (no stripping needed).
