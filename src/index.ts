@@ -559,31 +559,33 @@ function parseConfig(
   onSkip: (index: number, err: unknown) => void,
 ): (AppConfig | null)[] {
   const raw = config as Record<string, unknown>
-  const apps = Array.isArray(raw['apps']) ? raw['apps'] : []
-  const objectApps = apps.filter(
-    (a): a is Record<string, unknown> => typeof a === 'object' && a !== null,
-  )
+  const apps: unknown[] = Array.isArray(raw['apps']) ? raw['apps'] : []
   // Cap the number of configured apps to avoid pathological config sizes
   // exhausting resources. Silently dropping the overflow would be confusing
   // for an operator wondering why their 17th app isn't reachable — surface
   // the truncation via the skip callback so it lands in the SignalK log.
-  if (objectApps.length > MAX_APP_SLOTS) {
-    for (let i = MAX_APP_SLOTS; i < objectApps.length; i++) {
+  if (apps.length > MAX_APP_SLOTS) {
+    for (let i = MAX_APP_SLOTS; i < apps.length; i++) {
       onSkip(i, new Error(`exceeds MAX_APP_SLOTS=${String(MAX_APP_SLOTS)}; ignored`))
     }
   }
-  const validObjects = objectApps.slice(0, MAX_APP_SLOTS)
-  // Push a null placeholder for any app that fails validation so the surviving
-  // apps keep their original positional index. Compacting the array instead
-  // would silently shift every later app down — e.g. a bad app at index 1
-  // would move the app the operator configured at index 2 to /proxy/1,
-  // breaking bookmarked numeric URLs and serving the wrong target. Callers
-  // treat a null slot as "no app" (404).
+  const slots = apps.slice(0, MAX_APP_SLOTS)
+  // Push a null placeholder for any slot that is invalid — whether it's a
+  // non-object entry or an object that fails validation — so the surviving
+  // apps keep their original positional index. Compacting the array (e.g. by
+  // filtering out non-objects first) would silently shift every later app
+  // down — a bad entry at index 1 would move the app the operator configured
+  // at index 2 to /proxy/1, breaking bookmarked numeric URLs and serving the
+  // wrong target. Callers treat a null slot as "no app" (404).
   const results: (AppConfig | null)[] = []
   const seenPaths = new Set<string>()
-  for (let i = 0; i < validObjects.length; i++) {
+  for (let i = 0; i < slots.length; i++) {
     try {
-      const appConfig = parseAppConfig(validObjects[i]!, i)
+      const candidate = slots[i]
+      if (typeof candidate !== 'object' || candidate === null) {
+        throw new Error(`Invalid app entry at index ${i}: expected an object`)
+      }
+      const appConfig = parseAppConfig(candidate as Record<string, unknown>, i)
       if (appConfig.appPath.length > 0) {
         // appConfig.appPath is already lowercased by parseAppConfig.
         if (seenPaths.has(appConfig.appPath)) {
@@ -896,27 +898,37 @@ function addCspNonce(csp: string, nonce: string): string {
       !lower.some((t) => t.startsWith("'nonce-") || t === "'strict-dynamic'")
     )
   }
+  // Track script-src and script-src-elem separately. An inline <script> element
+  // is governed by script-src-elem when present (it overrides script-src for
+  // script elements), so both must get the nonce — patching only the last-seen
+  // one would leave the governing directive unpatched depending on header order.
   let scriptIdx = -1
+  let scriptElemIdx = -1
   let defaultIdx = -1
   for (let i = 0; i < directives.length; i++) {
     const name = directives[i]!.split(/\s+/)[0]?.toLowerCase() ?? ''
-    if (name === 'script-src' || name === 'script-src-elem') scriptIdx = i
+    if (name === 'script-src') scriptIdx = i
+    else if (name === 'script-src-elem') scriptElemIdx = i
     else if (name === 'default-src') defaultIdx = i
   }
-  if (scriptIdx >= 0) {
-    const dir = directives[scriptIdx]!
+  const patchAt = (idx: number): void => {
+    const dir = directives[idx]!
     if (!inlineAlreadyAllowed(dir.split(/\s+/).slice(1))) {
-      directives[scriptIdx] = `${dir} ${nonceSrc}`
+      directives[idx] = `${dir} ${nonceSrc}`
     }
-  } else if (defaultIdx >= 0) {
-    // Scripts fall back to default-src; add an explicit script-src that mirrors
-    // it plus our nonce, unless default-src already allows inline scripts.
+  }
+  if (scriptIdx >= 0) patchAt(scriptIdx)
+  if (scriptElemIdx >= 0) patchAt(scriptElemIdx)
+  if (scriptIdx < 0 && scriptElemIdx < 0 && defaultIdx >= 0) {
+    // No script directive; scripts fall back to default-src. Add an explicit
+    // script-src that mirrors it plus our nonce, unless default-src already
+    // allows inline scripts.
     const tokens = directives[defaultIdx]!.split(/\s+/).slice(1)
     if (!inlineAlreadyAllowed(tokens)) {
       directives.push(`script-src ${[...tokens, nonceSrc].join(' ')}`)
     }
   }
-  // else: neither script-src nor default-src — scripts are already unrestricted.
+  // else: neither script directive nor default-src — scripts already unrestricted.
   return directives.join('; ')
 }
 

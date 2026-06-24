@@ -868,6 +868,47 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(mockError).toHaveBeenCalledWith(expect.stringContaining('config index 1'))
     })
 
+    it('keeps indices stable when a non-object config entry sits between valid apps', () => {
+      // A non-object slot (string/null/number) must become a null placeholder
+      // too, not be filtered out (which would collapse later indices).
+      const proxy0: MockProxyMiddleware = jest.fn()
+      const proxy2: MockProxyMiddleware = jest.fn()
+      mockCreateProxyMiddleware.mockReturnValueOnce(proxy0).mockReturnValueOnce(proxy2)
+
+      plugin.start(
+        {
+          apps: [
+            { name: 'A', url: 'http://host-a:8080' },
+            'not-an-object',
+            { name: 'C', url: 'http://host-c:3000' },
+          ],
+        },
+        jest.fn(),
+      )
+      plugin.registerWithRouter!(mockRouter)
+
+      const appsHandler = registeredGetHandlers.get('/apps')!
+      const appsRes = { json: jest.fn() } as unknown as Response
+      appsHandler({} as Request, appsRes)
+      expect(appsRes.json).toHaveBeenCalledWith([
+        { index: 0, name: 'A' },
+        { index: 2, name: 'C' },
+      ])
+
+      const handler = registeredHandlers.get('/proxy/:appId')!
+      const next = jest.fn()
+      handler({ params: { appId: '2' }, url: '/' } as unknown as Request, {} as Response, next)
+      expect(proxy2).toHaveBeenCalled()
+
+      const res1 = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn().mockReturnThis(),
+      } as unknown as Response
+      handler({ params: { appId: '1' }, url: '/' } as unknown as Request, res1, next)
+      expect(res1.status).toHaveBeenCalledWith(404)
+      expect(mockError).toHaveBeenCalledWith(expect.stringContaining('config index 1'))
+    })
+
     it('registers parameterized /proxy/:appId route', () => {
       plugin.registerWithRouter!(mockRouter)
       expect(mockRouter.use).toHaveBeenCalledWith('/proxy/:appId', expect.any(Function))
@@ -3336,6 +3377,26 @@ describe('pure helpers (direct unit tests)', () => {
 
     it('targets script-src-elem as well', () => {
       expect(H.addCspNonce("script-src-elem 'self'", N)).toBe(`script-src-elem 'self' 'nonce-${N}'`)
+    })
+
+    it('patches both script-src and script-src-elem regardless of directive order', () => {
+      // script-src-elem governs inline <script> elements when present, so both
+      // must carry the nonce — patching only the last-seen one would block the
+      // injected script depending on header order.
+      expect(H.addCspNonce("script-src 'self'; script-src-elem 'self'", N)).toBe(
+        `script-src 'self' 'nonce-${N}'; script-src-elem 'self' 'nonce-${N}'`,
+      )
+      expect(H.addCspNonce("script-src-elem 'self'; script-src 'self'", N)).toBe(
+        `script-src-elem 'self' 'nonce-${N}'; script-src 'self' 'nonce-${N}'`,
+      )
+    })
+
+    it('does not fall back to default-src when a script directive is present', () => {
+      // script-src-elem present → governs scripts; default-src is left alone and
+      // no extra script-src is appended.
+      expect(H.addCspNonce("default-src 'self'; script-src-elem 'self'", N)).toBe(
+        `default-src 'self'; script-src-elem 'self' 'nonce-${N}'`,
+      )
     })
   })
 
