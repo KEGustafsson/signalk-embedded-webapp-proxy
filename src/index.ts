@@ -344,6 +344,41 @@ function rewriteHtmlAttributes(html: string, proxyPathPrefix: string, appBasePat
   return out
 }
 
+/** Escape a string for literal use inside a RegExp. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// Rewrite a SPA's embedded base-path config so the app's own absolute
+// navigations land on the proxy URL space.
+//
+// WHY THIS IS NEEDED (and the injected script is not enough): some SPAs build
+// hard navigations from a base path embedded in an inline bootstrap blob, e.g.
+// Grafana does `window.location.href = grafanaBootData.settings.appSubUrl + "/"`
+// after login. `window.location` is [LegacyUnforgeable] per WebIDL — `href`,
+// `assign`, and `replace` are non-configurable OWN properties of the live
+// Location object (NOT on Location.prototype), so they cannot be patched or
+// shadowed from JS. The injected script's location hooks are therefore no-ops
+// in real browsers, and such a navigation escapes the proxy (e.g. a top-level
+// GET to /grafana/ that the SignalK server answers with "Cannot GET /grafana/").
+//
+// The only reliable fix is to make the embedded base path already equal the
+// proxy prefix, so `appSubUrl + "/"` resolves to the proxied URL natively —
+// exactly as if the app had been deployed with the proxy path as its base.
+// We rewrite the well-known token Grafana emits. Other apps that don't emit it
+// are unaffected (the replace simply matches nothing).
+function rewriteEmbeddedBasePath(
+  html: string,
+  proxyPathPrefix: string,
+  appBasePath: string,
+): string {
+  const base = appBasePath === '/' ? '' : appBasePath.replace(/\/$/, '')
+  // Grafana bootstrap: `"appSubUrl":"<base>"` (base is "" when served at root).
+  // Match optional whitespace around the colon as JSON serialisers may add it.
+  const re = new RegExp(`("appSubUrl"\\s*:\\s*")${escapeRegExp(base)}(")`, 'g')
+  return html.replace(re, `$1${proxyPathPrefix}$2`)
+}
+
 /**
  * Delete any request header whose name is not a valid HTTP token, so a malformed
  * header cannot smuggle past the proxy into the upstream request.
@@ -770,16 +805,26 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
     'var OR=H.replaceState.bind(H);' +
     'H.pushState=function(s,t,u){if(typeof u==="string")u=Y(u);return OP(s,t,u)};' +
     'H.replaceState=function(s,t,u){if(typeof u==="string")u=Y(u);return OR(s,t,u)};}' +
-    // --- window.location.assign / replace ---
-    // Catch hard-redirect style navigation (location.assign('/login')).
-    'try{var L=window.location;' +
-    'var LA=L.assign.bind(L);var LR=L.replace.bind(L);' +
-    'L.assign=function(u){if(typeof u==="string")u=Y(u);return LA(u)};' +
-    'L.replace=function(u){if(typeof u==="string")u=Y(u);return LR(u)};}catch(e){}' +
-    // --- Location.prototype.href setter ---
-    // Intercept location.href = '/path' so it navigates through the proxy.
-    // The getter is NOT overridden — Angular and other frameworks need the
-    // real pathname/href to match the rewritten <base> tag.
+    // --- Location.prototype.assign / replace / href (BEST-EFFORT ONLY) ---
+    // IMPORTANT: window.location is [LegacyUnforgeable] per WebIDL — assign,
+    // replace, and href are non-configurable OWN properties of the live Location
+    // instance, NOT inherited from Location.prototype. So in real browsers
+    // Location.prototype.assign is undefined and these patches are no-ops; the
+    // try/catch and `typeof===function` guards simply make them silently inert.
+    // They are retained for non-browser/edge runtimes that DO expose these on
+    // the prototype. The reliable handling of hard navigations like Grafana's
+    // post-login `location.href = appSubUrl + "/"` is done server-side by
+    // rewriteEmbeddedBasePath (see src), not here.
+    'try{var LpN=Location.prototype;' +
+    'var LA=LpN.assign;if(typeof LA==="function"){' +
+    'LpN.assign=function(u){if(typeof u==="string")u=Y(u);return LA.call(this,u)}}' +
+    'var LR=LpN.replace;if(typeof LR==="function"){' +
+    'LpN.replace=function(u){if(typeof u==="string")u=Y(u);return LR.call(this,u)}}' +
+    '}catch(e){}' +
+    // Best-effort href setter patch (also a no-op on real [LegacyUnforgeable]
+    // Location objects; see the note above). The getter is NOT overridden —
+    // Angular and other frameworks need the real pathname/href to match the
+    // rewritten <base> tag.
     'try{var LP=Location.prototype;' +
     'var hD=Object.getOwnPropertyDescriptor(LP,"href");' +
     'if(hD&&hD.set){var hS=hD.set;' +
@@ -1121,7 +1166,12 @@ function rewriteHtmlResponse(
       const htmlRe = /<html\b[^>]*>/i
       injected = htmlRe.test(html) ? html.replace(htmlRe, (mm) => mm + scriptTag) : scriptTag + html
     }
-    const rewritten = rewriteHtmlAttributes(injected, proxyPathPrefix, appBasePath)
+    const attrRewritten = rewriteHtmlAttributes(injected, proxyPathPrefix, appBasePath)
+    // Point any embedded base-path config (e.g. Grafana's appSubUrl) at the
+    // proxy so the app's own hard navigations (location.href = appSubUrl + "/")
+    // land on the proxy — location is [LegacyUnforgeable] and cannot be hooked
+    // from the injected script. See rewriteEmbeddedBasePath.
+    const rewritten = rewriteEmbeddedBasePath(attrRewritten, proxyPathPrefix, appBasePath)
     const buf = Buffer.from(rewritten, 'utf-8')
     // The client may have disconnected after the last chunk; writing to a
     // finished/destroyed response throws synchronously (unhandled → crash).
@@ -1564,6 +1614,7 @@ Object.assign(module.exports, {
   rewriteSetCookie,
   splitCookieAttributes,
   rewriteHtmlAttributes,
+  rewriteEmbeddedBasePath,
   buildRewriteScript,
   addCspNonce,
   resolveRootEscape,
