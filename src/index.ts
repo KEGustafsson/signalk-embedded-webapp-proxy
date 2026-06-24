@@ -1,6 +1,7 @@
 import type { Plugin, ServerAPI } from '@signalk/server-api'
 import type { IRouter, Request, Response } from 'express'
 import type { ClientRequest, IncomingMessage, Server, ServerResponse } from 'http'
+import { randomBytes } from 'crypto'
 import { Socket } from 'net'
 import { Readable } from 'stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'zlib'
@@ -68,6 +69,19 @@ const MAX_APP_SLOTS = 16
 // from a misbehaving or hostile upstream.
 const MAX_HTML_REWRITE_BYTES = 10 * 1024 * 1024 // 10 MiB
 
+// Aggregate cap across all *concurrent* HTML rewrites. The per-response cap
+// above bounds one request; this bounds total buffered memory so many
+// simultaneous large-HTML requests (reachable by an authenticated admin)
+// can't exhaust RAM on a small device. Over the cap, a request degrades to a
+// 503 rather than buffering unboundedly.
+const MAX_TOTAL_REWRITE_BYTES = 64 * 1024 * 1024 // 64 MiB
+
+// Opening tag of the injected rewrite <script>. Shared between buildRewriteScript
+// (which emits it) and the response path (which splices a per-response nonce in
+// after `<script `), so the two stay in lockstep.
+const REWRITE_SCRIPT_MARKER = 'data-signalk-embedded-webapp-proxy="path-rewrite"'
+const REWRITE_SCRIPT_OPEN = `<script ${REWRITE_SCRIPT_MARKER}>`
+
 // Pattern for custom app path identifiers — must start with a letter so it
 // cannot be confused with a numeric index.
 const APP_PATH_PATTERN = /^[a-zA-Z][a-zA-Z0-9-]*$/
@@ -87,6 +101,11 @@ const ROOT_ESCAPE = '/__root__'
 // embedded apps with sub-path APIs (e.g. Grafana /api/...) keep working.
 const ROOT_NAMESPACES = ['/plugins/', '/signalk/', '/admin/', '/skServer/']
 
+/**
+ * True when `path` is a SignalK server root namespace (`/plugins/`, `/signalk/`,
+ * `/admin/`, `/skServer/`) that an embedded app may need to reach via the
+ * host-only proxy — excluding this plugin's own prefix.
+ */
 function isRootNamespace(path: string): boolean {
   // Never escape paths that already belong to this plugin — preserves routing
   // between sibling apps configured on the same plugin instance.
@@ -168,6 +187,18 @@ function rewriteSetCookie(
     const parts = splitCookieAttributes(cookie)
     const out: string[] = []
     let sawPath = false
+    // A "__Host-" prefixed cookie is only accepted by the browser when it has
+    // Path=/ (and no Domain, and Secure). Rewriting its Path to the proxy
+    // subtree would make the browser reject the cookie outright, silently
+    // breaking auth. So for these we keep Path=/ — the cookie ends up scoped to
+    // the whole SignalK origin, which is acceptable under the documented
+    // same-origin "only proxy trusted apps" model and strictly better than a
+    // dropped cookie. ("__Secure-" has no Path constraint, so it needs no
+    // special-casing.) The prefix match is case-insensitive per RFC 6265bis.
+    const firstPart = parts[0] ?? ''
+    const firstEq = firstPart.indexOf('=')
+    const cookieName = (firstEq >= 0 ? firstPart.slice(0, firstEq) : firstPart).trim()
+    const isHostPrefixed = /^__Host-/i.test(cookieName)
     for (const raw of parts) {
       const part = raw.trim()
       if (!part) continue
@@ -180,6 +211,11 @@ function rewriteSetCookie(
       if (name === 'path') {
         if (sawPath) continue // drop duplicates; first Path wins
         sawPath = true
+        if (isHostPrefixed) {
+          // Preserve Path=/ so the __Host- cookie stays valid (see above).
+          out.push(part)
+          continue
+        }
         let value = eq >= 0 ? part.slice(eq + 1).trim() : ''
         // Strip surrounding quotes (RFC 6265 doesn't allow it, but real
         // upstreams sometimes emit Path="…"; honouring the quotes prevents
@@ -215,18 +251,62 @@ function rewriteSetCookie(
   })
 }
 
-// Rewrite absolute-path values in src/href/action HTML attributes while
-// preserving the *bodies* of <script>, <style>, <textarea>, and HTML
-// comments verbatim — those can contain URL-attribute-shaped substrings
-// (string literals, CSS, escaped sample text) that must not be touched.
-// Opening-tag attributes (e.g. <script src="…">) are still rewritten.
+// Precompiled closing-tag matchers for the verbatim-body elements, keyed by
+// lowercased tag name — avoids compiling a fresh RegExp per matched tag.
+const CLOSE_TAG_RE: Record<string, RegExp> = {
+  script: /<\/script\s*>/i,
+  style: /<\/style\s*>/i,
+  textarea: /<\/textarea\s*>/i,
+}
+
+// Rewrite absolute-path values in src/href/action HTML attributes (and the
+// URLs inside srcset) while preserving the *bodies* of <script>, <style>,
+// <textarea>, and HTML comments verbatim — those can contain URL-attribute-
+// shaped substrings (string literals, CSS, escaped sample text) that must not
+// be touched.  Opening-tag attributes (e.g. <script src="…">) are still
+// rewritten. Both quoted (src="/x") and unquoted (href=/x) attribute values
+// are handled; the runtime patches in the injected script cover values set
+// dynamically from JS.
 function rewriteHtmlAttributes(html: string, proxyPathPrefix: string, appBasePath: string): string {
-  const attrRe = /((?:src|href|action)=["'])(\/[^"']*)/gi
-  const replaceAttr = (_m: string, attr: string, url: string): string => {
-    if (url.startsWith('//')) return `${attr}${url}` // protocol-relative
-    if (url.startsWith(proxyPathPrefix)) return `${attr}${url}` // already proxied
-    return `${attr}${proxyPathPrefix}${computeProxiedSuffix(url, appBasePath)}`
+  const toProxy = (url: string): string => {
+    if (url.startsWith('//')) return url // protocol-relative
+    if (url.startsWith(proxyPathPrefix)) return url // already proxied
+    return `${proxyPathPrefix}${computeProxiedSuffix(url, appBasePath)}`
   }
+  // Quoted absolute-path src/href/action values: src="/x", href='/y'.
+  const attrRe = /((?:src|href|action)=["'])(\/[^"']*)/gi
+  const replaceAttr = (_m: string, attr: string, url: string): string => `${attr}${toProxy(url)}`
+  // Unquoted absolute-path values: <a href=/login>. Stops at whitespace or '>'.
+  // Mutually exclusive with attrRe, which requires a quote right after '='.
+  const attrReUnquoted = /((?:src|href|action)=)(\/[^\s"'>]*)/gi
+  const replaceAttrUnquoted = (_m: string, attr: string, url: string): string =>
+    `${attr}${toProxy(url)}`
+  // srcset is a comma-separated list of "url [descriptor]" entries; rewrite
+  // each absolute-path URL while preserving its descriptor (e.g. "2x", "640w").
+  const srcsetRe = /(srcset=["'])([^"']*)(["'])/gi
+  const replaceSrcset = (_m: string, open: string, list: string, close: string): string => {
+    const rewritten = list
+      .split(',')
+      .map((entry) => {
+        const trimmed = entry.trim()
+        if (!trimmed) return entry
+        const sp = trimmed.search(/\s/)
+        const u = sp >= 0 ? trimmed.slice(0, sp) : trimmed
+        const desc = sp >= 0 ? trimmed.slice(sp) : ''
+        if (u.charAt(0) === '/' && u.charAt(1) !== '/' && !u.startsWith(proxyPathPrefix)) {
+          return `${proxyPathPrefix}${computeProxiedSuffix(u, appBasePath)}${desc}`
+        }
+        return trimmed
+      })
+      .join(', ')
+    return `${open}${rewritten}${close}`
+  }
+  const rewriteChunk = (s: string): string =>
+    s
+      .replace(attrRe, replaceAttr)
+      .replace(attrReUnquoted, replaceAttrUnquoted)
+      .replace(srcsetRe, replaceSrcset)
+
   // Match an HTML comment OR the opening tag of an element whose contents we
   // must preserve verbatim.  Comments are kept as-is; opening tags are
   // attribute-rewritten and their bodies passed through unchanged.
@@ -235,7 +315,7 @@ function rewriteHtmlAttributes(html: string, proxyPathPrefix: string, appBasePat
   let i = 0
   let m: RegExpExecArray | null
   while ((m = boundaryRe.exec(html)) !== null) {
-    out += html.slice(i, m.index).replace(attrRe, replaceAttr)
+    out += rewriteChunk(html.slice(i, m.index))
     if (!m[1]) {
       // Comment — append verbatim.
       out += m[0]
@@ -245,9 +325,9 @@ function rewriteHtmlAttributes(html: string, proxyPathPrefix: string, appBasePat
     }
     // Opening <script>/<style>/<textarea> — rewrite its attributes, then skip
     // until the matching closing tag.
-    out += m[0].replace(attrRe, replaceAttr)
+    out += rewriteChunk(m[0])
     const bodyStart = m.index + m[0].length
-    const closeRe = new RegExp(`</${m[1]}\\s*>`, 'i')
+    const closeRe = CLOSE_TAG_RE[m[1].toLowerCase()]!
     const closeMatch = closeRe.exec(html.slice(bodyStart))
     if (!closeMatch) {
       // No closing tag — keep the rest of the document verbatim.
@@ -260,10 +340,14 @@ function rewriteHtmlAttributes(html: string, proxyPathPrefix: string, appBasePat
     i = closeEnd
     boundaryRe.lastIndex = closeEnd
   }
-  out += html.slice(i).replace(attrRe, replaceAttr)
+  out += rewriteChunk(html.slice(i))
   return out
 }
 
+/**
+ * Delete any request header whose name is not a valid HTTP token, so a malformed
+ * header cannot smuggle past the proxy into the upstream request.
+ */
 function stripInvalidHeaders(req: IncomingMessage): void {
   if (!req.headers) return
   for (const key of Object.keys(req.headers)) {
@@ -273,10 +357,12 @@ function stripInvalidHeaders(req: IncomingMessage): void {
   }
 }
 
+/** Canonicalise a hostname for comparison: trim, lowercase, and strip trailing dots. */
 function normalizeHost(host: string): string {
   return host.trim().toLowerCase().replace(/\.+$/, '')
 }
 
+/** Validate a hostname: permitted characters only, and not a known cloud-metadata endpoint. */
 function isValidHost(host: string): boolean {
   const normalized = normalizeHost(host)
   if (!HOST_PATTERN.test(normalized)) return false
@@ -284,6 +370,7 @@ function isValidHost(host: string): boolean {
   return true
 }
 
+/** Build the upstream target URL (scheme://host:port + base path) for an app's main proxy. */
 function buildTarget(appConfig: AppConfig): string {
   // Strip trailing slash from path so node-http-proxy doesn't produce double-slashes.
   // A root path '/' becomes '' so the target is scheme://host:port with no path suffix.
@@ -291,6 +378,7 @@ function buildTarget(appConfig: AppConfig): string {
   return `${appConfig.scheme}://${appConfig.host}:${String(appConfig.port)}${path}`
 }
 
+/** Build the host-only upstream target (no base path) used for `/__root__`-escaped requests. */
 function buildRootTarget(appConfig: AppConfig): string {
   // Host-only target for root-escaped requests (e.g. /plugins/<other>/ws calls
   // from within a path-scoped proxied webapp).
@@ -307,6 +395,23 @@ function computeTargetOrigin(appConfig: AppConfig): string {
     (appConfig.scheme === 'https' && appConfig.port === 443)
   const hostPort = isDefaultPort ? appConfig.host : `${appConfig.host}:${String(appConfig.port)}`
   return `${appConfig.scheme}://${hostPort}`
+}
+
+// Coerce a Node header value (string | string[] | undefined) to its first
+// string value. Centralises the origin/host/proto narrowing that was
+// otherwise spelled three slightly different ways.
+function firstHeaderValue(value: string | string[] | undefined): string {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) return value[0] ?? ''
+  return ''
+}
+
+// True when the incoming request arrived over a TLS socket. `req.socket` is
+// typed as net.Socket, which lacks `encrypted` (a tls.TLSSocket field), so the
+// cast is unavoidable; isolating it here keeps the call sites clean and the
+// intent ("is this a TLS connection?") self-documenting.
+function isEncrypted(req: IncomingMessage): boolean {
+  return (req.socket as Partial<{ encrypted: boolean }>).encrypted === true
 }
 
 // Apply X-Real-IP / X-Forwarded-* to an outgoing proxied request. Shared between
@@ -330,8 +435,7 @@ function applyForwardedHeaders(
   const remoteAddress = req.socket?.remoteAddress ?? ''
   proxyReq.setHeader('X-Real-IP', remoteAddress)
   proxyReq.setHeader('X-Forwarded-For', remoteAddress)
-  const incomingProto = req.headers['x-forwarded-proto']
-  const rawProto = typeof incomingProto === 'string' ? incomingProto : (incomingProto?.[0] ?? '')
+  const rawProto = firstHeaderValue(req.headers['x-forwarded-proto'])
   const firstProto = rawProto.split(',')[0]?.trim().toLowerCase() ?? ''
   const validProto =
     firstProto === 'http' || firstProto === 'https' || firstProto === 'ws' || firstProto === 'wss'
@@ -342,8 +446,8 @@ function applyForwardedHeaders(
   // links, OAuth callbacks) can still reach this proxy. changeOrigin: true
   // rewrites the wire Host header to the target, so X-Forwarded-Host is the
   // only way to communicate the original.
-  const incomingHost = req.headers['host']
-  if (typeof incomingHost === 'string' && incomingHost.length > 0) {
+  const incomingHost = firstHeaderValue(req.headers['host'])
+  if (incomingHost.length > 0) {
     proxyReq.setHeader('X-Forwarded-Host', incomingHost)
   }
 }
@@ -373,14 +477,16 @@ function rewriteOriginHeader(
   req: IncomingMessage,
   targetOrigin: string,
 ): void {
-  const incoming = req.headers['origin']
-  const origin =
-    typeof incoming === 'string' ? incoming : Array.isArray(incoming) ? (incoming[0] ?? '') : ''
+  const origin = firstHeaderValue(req.headers['origin'])
   if (origin.length > 0) {
     proxyReq.setHeader('Origin', targetOrigin)
   }
 }
 
+/**
+ * Validate and normalise one raw app-config entry into an {@link AppConfig}.
+ * Throws if the entry is invalid (missing/blocked URL, scheme, host, appPath, timeout).
+ */
 function parseAppConfig(raw: Record<string, unknown>, index: number): AppConfig {
   const rawUrl = typeof raw['url'] === 'string' ? raw['url'].trim() : ''
   if (rawUrl.length === 0) {
@@ -465,27 +571,43 @@ function parseAppConfig(raw: Record<string, unknown>, index: number): AppConfig 
   }
 }
 
-function parseConfig(config: object, onSkip: (index: number, err: unknown) => void): AppConfig[] {
+/**
+ * Parse the plugin configuration into a position-stable array of app slots. Each
+ * slot is an {@link AppConfig}, or `null` when that config entry failed validation
+ * — the null placeholders keep the surviving apps' numeric indices stable.
+ */
+function parseConfig(
+  config: object,
+  onSkip: (index: number, err: unknown) => void,
+): (AppConfig | null)[] {
   const raw = config as Record<string, unknown>
-  const apps = Array.isArray(raw['apps']) ? raw['apps'] : []
-  const objectApps = apps.filter(
-    (a): a is Record<string, unknown> => typeof a === 'object' && a !== null,
-  )
+  const apps: unknown[] = Array.isArray(raw['apps']) ? raw['apps'] : []
   // Cap the number of configured apps to avoid pathological config sizes
   // exhausting resources. Silently dropping the overflow would be confusing
   // for an operator wondering why their 17th app isn't reachable — surface
   // the truncation via the skip callback so it lands in the SignalK log.
-  if (objectApps.length > MAX_APP_SLOTS) {
-    for (let i = MAX_APP_SLOTS; i < objectApps.length; i++) {
+  if (apps.length > MAX_APP_SLOTS) {
+    for (let i = MAX_APP_SLOTS; i < apps.length; i++) {
       onSkip(i, new Error(`exceeds MAX_APP_SLOTS=${String(MAX_APP_SLOTS)}; ignored`))
     }
   }
-  const validObjects = objectApps.slice(0, MAX_APP_SLOTS)
-  const results: AppConfig[] = []
+  const slots = apps.slice(0, MAX_APP_SLOTS)
+  // Push a null placeholder for any slot that is invalid — whether it's a
+  // non-object entry or an object that fails validation — so the surviving
+  // apps keep their original positional index. Compacting the array (e.g. by
+  // filtering out non-objects first) would silently shift every later app
+  // down — a bad entry at index 1 would move the app the operator configured
+  // at index 2 to /proxy/1, breaking bookmarked numeric URLs and serving the
+  // wrong target. Callers treat a null slot as "no app" (404).
+  const results: (AppConfig | null)[] = []
   const seenPaths = new Set<string>()
-  for (let i = 0; i < validObjects.length; i++) {
+  for (let i = 0; i < slots.length; i++) {
     try {
-      const appConfig = parseAppConfig(validObjects[i]!, i)
+      const candidate = slots[i]
+      if (typeof candidate !== 'object' || candidate === null) {
+        throw new Error(`Invalid app entry at index ${i}: expected an object`)
+      }
+      const appConfig = parseAppConfig(candidate as Record<string, unknown>, i)
       if (appConfig.appPath.length > 0) {
         // appConfig.appPath is already lowercased by parseAppConfig.
         if (seenPaths.has(appConfig.appPath)) {
@@ -496,20 +618,30 @@ function parseConfig(config: object, onSkip: (index: number, err: unknown) => vo
       results.push(appConfig)
     } catch (err) {
       onSkip(i, err)
+      results.push(null)
     }
   }
   return results
 }
 
-function resolveAppIndex(appId: string, apps: AppConfig[]): number {
+/**
+ * Resolve a proxy path segment — a canonical numeric index or a custom appPath —
+ * to its app index, or -1 when unknown, out of range, or a null placeholder slot.
+ */
+function resolveAppIndex(appId: string, apps: (AppConfig | null)[]): number {
   if (/^\d+$/.test(appId)) {
     // Reject non-canonical numeric forms (e.g. "00", "01") so the URL space
     // remains 1:1 with the app — distinct cache/cookie scopes for the same
     // index are otherwise possible.
     if (appId.length > 1 && appId.startsWith('0')) return -1
-    return Number(appId)
+    const n = Number(appId)
+    // Range-check here rather than relying on every caller, so correctness
+    // never hinges on the apps/proxies arrays staying the same length, and a
+    // null placeholder slot (an app that failed validation) resolves to 404
+    // instead of indexing past the proxies array.
+    return n < apps.length && apps[n] != null ? n : -1
   }
-  return apps.findIndex((a) => a.appPath === appId.toLowerCase())
+  return apps.findIndex((a) => a != null && a.appPath === appId.toLowerCase())
 }
 
 /**
@@ -542,6 +674,11 @@ function jsLiteral(s: string): string {
     .replace(/-->/g, '--\\u003e')
     .replace(lineSep, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'))
 }
+/**
+ * Build the inline `<script>` injected into HTML responses (when rewritePaths is
+ * enabled) that patches fetch/XHR/WebSocket/history/location and the DOM so the
+ * app's absolute paths route through the proxy. See the block comment above for detail.
+ */
 function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): string {
   const prefix = jsLiteral(proxyPathPrefix)
   // Normalise: strip trailing slash; "/" becomes "" (no stripping needed).
@@ -555,7 +692,7 @@ function buildRewriteScript(proxyPathPrefix: string, appBasePath: string): strin
   // not be root-escaped on the client either.
   const pluginPrefix = jsLiteral(PLUGIN_PATH_PREFIX)
   return (
-    '<script data-signalk-embedded-webapp-proxy="path-rewrite">' +
+    REWRITE_SCRIPT_OPEN +
     '(function(){' +
     `var P=${prefix};` +
     `var B=${baseJson};` +
@@ -716,8 +853,8 @@ function streamThrough(proxyRes: IncomingMessage, res: ServerResponse): void {
   for (const h of HOP_BY_HOP_HEADERS) {
     delete headers[h]
   }
-  // Attach error handler BEFORE pipe so a synchronous error doesn't become
-  // an unhandled 'error' event.
+  // Attach error handlers BEFORE pipe so a synchronous error doesn't become
+  // an unhandled 'error' event (which would crash the process).
   proxyRes.on('error', () => {
     // Upstream errored mid-stream.  Headers may already be sent so the best
     // we can do is destroy the connection so the client knows the body is
@@ -728,14 +865,303 @@ function streamThrough(proxyRes: IncomingMessage, res: ServerResponse): void {
       // already destroyed
     }
   })
-  res.writeHead(proxyRes.statusCode ?? 200, headers)
+  // If the client (iframe) disconnects, stop reading the upstream so it doesn't
+  // leak, and swallow the 'error' that the aborted write would otherwise emit.
+  res.on('error', () => {
+    try {
+      proxyRes.destroy()
+    } catch {
+      // already destroyed
+    }
+  })
+  // The client may already be gone by the time the upstream is readable; calling
+  // writeHead on a finished/destroyed response throws synchronously.
+  if (res.headersSent || res.writableEnded || res.destroyed) {
+    proxyRes.destroy()
+    return
+  }
+  try {
+    res.writeHead(proxyRes.statusCode ?? 200, headers)
+  } catch {
+    proxyRes.destroy()
+    return
+  }
   proxyRes.pipe(res)
 }
 
+// Resolve the /__root__ escape: strip the marker from `path` and select the
+// host-only `root` proxy (else the `main` proxy). Shared by the HTTP route and
+// the WS upgrade handler so this security-relevant routing decision lives in
+// one place. `proxy` is undefined when a root escape is requested but the app
+// has no root proxy — callers turn that into a 404.
+function resolveRootEscape(
+  path: string,
+  pair: ProxyPair,
+): { path: string; proxy: RequestHandler | undefined } {
+  if (path === ROOT_ESCAPE || path.startsWith(ROOT_ESCAPE + '/')) {
+    return { path: path.slice(ROOT_ESCAPE.length) || '/', proxy: pair.root }
+  }
+  return { path, proxy: pair.main }
+}
+
+// Total bytes currently buffered across all concurrent HTML rewrites; bounded
+// by MAX_TOTAL_REWRITE_BYTES (see rewriteHtmlResponse).
+let inFlightRewriteBytes = 0
+
+// Add a nonce-source to a CSP's script directive so the injected inline rewrite
+// <script> is allowed, WITHOUT deleting the upstream policy. Deleting CSP would
+// also remove the proxied app's own XSS containment — and because the app runs
+// at the SignalK admin origin under allow-same-origin, that containment is the
+// only thing keeping an app-level XSS from reaching the admin session. Skips the
+// change when inline scripts are already allowed via 'unsafe-inline' without a
+// nonce/strict-dynamic, since adding a nonce there would *disable* the
+// 'unsafe-inline' under CSP Level 3 and break the app's own inline scripts.
+function addCspNonce(csp: string, nonce: string): string {
+  const directives = csp
+    .split(';')
+    .map((d) => d.trim())
+    .filter(Boolean)
+  const nonceSrc = `'nonce-${nonce}'`
+  const inlineAlreadyAllowed = (tokens: string[]): boolean => {
+    const lower = tokens.map((t) => t.toLowerCase())
+    return (
+      lower.includes("'unsafe-inline'") &&
+      !lower.some((t) => t.startsWith("'nonce-") || t === "'strict-dynamic'")
+    )
+  }
+  // Track script-src and script-src-elem separately. An inline <script> element
+  // is governed by script-src-elem when present (it overrides script-src for
+  // script elements), so both must get the nonce — patching only the last-seen
+  // one would leave the governing directive unpatched depending on header order.
+  let scriptIdx = -1
+  let scriptElemIdx = -1
+  let defaultIdx = -1
+  for (let i = 0; i < directives.length; i++) {
+    const name = directives[i]!.split(/\s+/)[0]?.toLowerCase() ?? ''
+    if (name === 'script-src') scriptIdx = i
+    else if (name === 'script-src-elem') scriptElemIdx = i
+    else if (name === 'default-src') defaultIdx = i
+  }
+  const patchAt = (idx: number): void => {
+    const dir = directives[idx]!
+    if (!inlineAlreadyAllowed(dir.split(/\s+/).slice(1))) {
+      directives[idx] = `${dir} ${nonceSrc}`
+    }
+  }
+  if (scriptIdx >= 0) patchAt(scriptIdx)
+  if (scriptElemIdx >= 0) patchAt(scriptElemIdx)
+  if (scriptIdx < 0 && scriptElemIdx < 0 && defaultIdx >= 0) {
+    // No script directive; scripts fall back to default-src. Add an explicit
+    // script-src that mirrors it plus our nonce, unless default-src already
+    // allows inline scripts.
+    const tokens = directives[defaultIdx]!.split(/\s+/).slice(1)
+    if (!inlineAlreadyAllowed(tokens)) {
+      directives.push(`script-src ${[...tokens, nonceSrc].join(' ')}`)
+    }
+  }
+  // else: neither script directive nor default-src — scripts already unrestricted.
+  return directives.join('; ')
+}
+
+// Decompress (when needed), inject the rewrite <script> with a per-response
+// nonce, rewrite attribute URLs, and send. Extracted from the proxyRes hook so
+// the heavy buffering/decompression path has a name and a testable boundary.
+// On any failure it fails safe (502/503, or a streamThrough pass-through).
+function rewriteHtmlResponse(
+  proxyRes: IncomingMessage,
+  res: ServerResponse,
+  opts: {
+    rewriteScript: string
+    proxyPathPrefix: string
+    appBasePath: string
+    logError: (msg: string) => void
+  },
+): void {
+  const { rewriteScript, proxyPathPrefix, appBasePath, logError } = opts
+  const status = proxyRes.statusCode ?? 200
+
+  // Only UTF-8 (and ASCII, its subset) can be safely decoded then re-encoded as
+  // utf-8. For any other declared charset, stream the body through unmodified
+  // rather than mojibake its non-ASCII bytes.
+  const ct = String(proxyRes.headers['content-type'] ?? '').toLowerCase()
+  const charset = /charset=["']?([^"';,\s]+)/.exec(ct)?.[1] ?? ''
+  if (
+    charset &&
+    charset !== 'utf-8' &&
+    charset !== 'utf8' &&
+    charset !== 'us-ascii' &&
+    charset !== 'ascii'
+  ) {
+    logError(
+      `Skipping HTML rewrite for non-UTF-8 charset "${charset}" — body streamed through unmodified`,
+    )
+    streamThrough(proxyRes, res)
+    return
+  }
+
+  const encoding = String(proxyRes.headers['content-encoding'] ?? '').toLowerCase()
+  // Pick a decompression stream for known encodings; for unknown non-empty
+  // encodings (e.g. zstd, compress) we can't safely modify the body — fall
+  // through to a raw pipe so the client receives the original bytes intact.
+  const knownEncoding =
+    encoding === '' ||
+    encoding === 'identity' ||
+    encoding === 'gzip' ||
+    encoding === 'x-gzip' ||
+    encoding === 'deflate' ||
+    encoding === 'br'
+  if (!knownEncoding) {
+    logError(
+      `Skipping HTML rewrite for unknown content-encoding "${encoding}" — body streamed through unmodified`,
+    )
+    streamThrough(proxyRes, res)
+    return
+  }
+
+  // Per-response nonce lets the injected inline <script> run under a strict
+  // upstream CSP without deleting the policy (see addCspNonce).
+  const nonce = randomBytes(16).toString('base64')
+  const scriptTag = rewriteScript.replace(
+    REWRITE_SCRIPT_OPEN,
+    `<script nonce="${nonce}" ${REWRITE_SCRIPT_MARKER}>`,
+  )
+
+  let aborted = false
+  let accounted = 0
+  const release = (): void => {
+    inFlightRewriteBytes -= accounted
+    accounted = 0
+  }
+  const abort = (body: string, statusCode = 502): void => {
+    if (aborted) return
+    aborted = true
+    release()
+    // Stop background reads on both legs (when there is no decompressor,
+    // stream === proxyRes and the second destroy() is a no-op).
+    try {
+      stream.destroy()
+    } catch {
+      // already destroyed
+    }
+    try {
+      proxyRes.destroy()
+    } catch {
+      // already destroyed
+    }
+    if (!res.headersSent) {
+      try {
+        res.writeHead(statusCode, { 'Content-Type': 'text/plain' })
+      } catch {
+        // headers raced to "sent"
+      }
+    }
+    try {
+      res.end(body)
+    } catch {
+      // already ended
+    }
+  }
+
+  // SECURITY: Bound decompressor output so a decompression-bomb upstream cannot
+  // allocate gigabytes before the per-chunk size check fires. Brotli supports a
+  // hard cap; gzip/deflate emit in bounded chunks so the per-chunk accumulator
+  // below enforces the cap within a single chunk.
+  const stream: Readable =
+    encoding === 'gzip' || encoding === 'x-gzip'
+      ? proxyRes.pipe(createGunzip())
+      : encoding === 'deflate'
+        ? proxyRes.pipe(createInflate())
+        : encoding === 'br'
+          ? proxyRes.pipe(createBrotliDecompress({ maxOutputLength: MAX_HTML_REWRITE_BYTES }))
+          : proxyRes
+  // Attach error handlers BEFORE wiring data/end so a synchronous error on the
+  // source after .pipe() does not become an unhandled 'error' event (crash).
+  proxyRes.on('error', () => abort('Bad Gateway: upstream error'))
+  if (stream !== proxyRes) {
+    stream.on('error', () => abort('Bad Gateway: decompression error'))
+  }
+  // If the client (iframe) goes away mid-rewrite, stop reading upstream and
+  // release the in-flight memory accounting.
+  res.on('error', () => abort('Bad Gateway: client error'))
+
+  const chunks: Buffer[] = []
+  let totalBytes = 0
+  stream.on('data', (chunk: Buffer) => {
+    if (aborted) return
+    // Per-request cap: check the projected size BEFORE pushing so we cannot
+    // briefly buffer 2× the cap with a single oversized chunk.
+    if (totalBytes + chunk.length > MAX_HTML_REWRITE_BYTES) {
+      abort('Bad Gateway: response too large to rewrite')
+      return
+    }
+    // Aggregate cap across all concurrent rewrites: protect total memory on
+    // small devices. Over the cap we 503 rather than buffer unboundedly.
+    if (inFlightRewriteBytes + chunk.length > MAX_TOTAL_REWRITE_BYTES) {
+      abort('Service Unavailable: too many concurrent responses to rewrite', 503)
+      return
+    }
+    totalBytes += chunk.length
+    accounted += chunk.length
+    inFlightRewriteBytes += chunk.length
+    chunks.push(chunk)
+  })
+  stream.on('end', () => {
+    if (aborted) return
+    release()
+    const html = Buffer.concat(chunks).toString('utf-8')
+    // <head[\s/>] disambiguates from <header...> while still matching <head>,
+    // <head class="...">, and the self-closing <head/> form.
+    const headRe = /<head(?=[\s/>])[^>]*>/i
+    let injected: string
+    if (headRe.test(html)) {
+      injected = html.replace(headRe, (mm) => mm + scriptTag)
+    } else {
+      // No <head> — inject at the start of <html> (for fragments) or at the
+      // document start. Keeps the runtime patches active even on malformed HTML.
+      const htmlRe = /<html\b[^>]*>/i
+      injected = htmlRe.test(html) ? html.replace(htmlRe, (mm) => mm + scriptTag) : scriptTag + html
+    }
+    const rewritten = rewriteHtmlAttributes(injected, proxyPathPrefix, appBasePath)
+    const buf = Buffer.from(rewritten, 'utf-8')
+    // The client may have disconnected after the last chunk; writing to a
+    // finished/destroyed response throws synchronously (unhandled → crash).
+    if (res.headersSent || res.writableEnded || res.destroyed) return
+    const headers = { ...proxyRes.headers }
+    delete headers['content-encoding'] // we decompressed
+    delete headers['transfer-encoding']
+    headers['content-length'] = String(buf.length)
+    // Inject the nonce into any upstream CSP so the inline script runs, instead
+    // of stripping the policy and removing the app's own XSS containment.
+    for (const key of ['content-security-policy', 'content-security-policy-report-only']) {
+      const csp = headers[key]
+      if (typeof csp === 'string' && csp.length > 0) {
+        headers[key] = addCspNonce(csp, nonce)
+      } else if (Array.isArray(csp)) {
+        headers[key] = csp.map((c) => addCspNonce(c, nonce))
+      }
+    }
+    try {
+      res.writeHead(status, headers)
+      res.end(buf)
+    } catch {
+      try {
+        res.destroy()
+      } catch {
+        // already destroyed
+      }
+    }
+  })
+}
+
 module.exports = function (app: ServerAPIWithServer): Plugin {
-  let proxies: ProxyPair[] = []
-  let currentApps: AppConfig[] = []
+  // Null slots are apps that failed validation; they hold their position so the
+  // surviving apps keep stable numeric indices (see parseConfig).
+  let proxies: (ProxyPair | null)[] = []
+  let currentApps: (AppConfig | null)[] = []
   let started = false
+  // Set when apps are configured but SignalK didn't expose app.server, so
+  // WebSocket upgrades can't be intercepted. Surfaced in statusMessage().
+  let wsUnavailable = false
   let upgradeHandler: ((req: IncomingMessage, socket: Socket, head: Buffer) => void) | null = null
 
   const plugin: Plugin = {
@@ -760,7 +1186,10 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
         app.error(`Skipping app at config index ${i}: ${String(err)}`)
       })
 
-      const nextProxies: ProxyPair[] = nextApps.map((appConfig, appIndex) => {
+      const nextProxies: (ProxyPair | null)[] = nextApps.map((appConfig, appIndex) => {
+        // Null slot: this config entry failed validation. Keep the position so
+        // later apps retain their numeric index (see parseConfig).
+        if (!appConfig) return null
         const proxyPathPrefix = `${PLUGIN_PATH_PREFIX}${PROXY_SUBPATH}/${appConfig.appPath || String(appIndex)}`
         // Compute the rewrite script once per app — its inputs are static for
         // the life of the plugin instance, so re-building it on every HTML
@@ -782,9 +1211,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
             selfHandleResponse: true,
             on: {
               proxyReq(proxyReq, req): void {
-                const defaultProto = (req.socket as { encrypted?: boolean }).encrypted
-                  ? 'https'
-                  : 'http'
+                const defaultProto = isEncrypted(req) ? 'https' : 'http'
                 applyForwardedHeaders(proxyReq, req, defaultProto)
                 // Realign Origin with the upstream Host that changeOrigin
                 // wrote. Apps that enforce same-origin WebSocket/CORS policy
@@ -828,9 +1255,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
               // fixRequestBody / Accept-Encoding — upgrades have no body and
               // no Content-Encoding to negotiate.
               proxyReqWs(proxyReq, req): void {
-                const defaultProto = (req.socket as { encrypted?: boolean }).encrypted
-                  ? 'wss'
-                  : 'ws'
+                const defaultProto = isEncrypted(req) ? 'wss' : 'ws'
                 applyForwardedHeaders(proxyReq, req, defaultProto)
                 rewriteOriginHeader(proxyReq, req, targetOrigin)
               },
@@ -840,7 +1265,6 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                 res: ServerResponse,
               ): void {
                 const ct = String(proxyRes.headers['content-type'] ?? '')
-                const status = proxyRes.statusCode ?? 200
 
                 if (enableRewrite) {
                   // Rewrite Location headers on redirects so the browser
@@ -873,134 +1297,17 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
                     )
                   }
 
-                  // Strip Content-Security-Policy headers so the injected
-                  // inline script is not blocked by a strict upstream CSP.
-                  // (The proxied app runs sandboxed inside an iframe at the
-                  // SignalK origin; the parent page's CSP still applies.)
-                  delete proxyRes.headers['content-security-policy']
-                  delete proxyRes.headers['content-security-policy-report-only']
-
+                  // HTML responses get the rewrite script injected (and any
+                  // upstream CSP nonce-patched rather than stripped, so the
+                  // proxied app keeps its own XSS containment). Everything else
+                  // streams straight through. rewriteHtmlResponse fails safe
+                  // (502/503 or a pass-through) on decode/size/charset issues.
                   if (ct.includes('text/html')) {
-                    const encoding = String(
-                      proxyRes.headers['content-encoding'] ?? '',
-                    ).toLowerCase()
-                    // Pick a decompression stream for known encodings; for
-                    // unknown non-empty encodings (e.g. zstd, compress) we
-                    // can't safely modify the body — fall through to a raw
-                    // pipe so the client receives the original bytes
-                    // intact, with the original Content-Encoding preserved.
-                    const knownEncoding =
-                      encoding === '' ||
-                      encoding === 'identity' ||
-                      encoding === 'gzip' ||
-                      encoding === 'x-gzip' ||
-                      encoding === 'deflate' ||
-                      encoding === 'br'
-                    if (!knownEncoding) {
-                      app.error(
-                        `Skipping HTML rewrite for unknown content-encoding "${encoding}" — body streamed through unmodified`,
-                      )
-                      streamThrough(proxyRes, res)
-                      return
-                    }
-                    let aborted = false
-                    const abort = (status502Body: string): void => {
-                      if (aborted) return
-                      aborted = true
-                      // Stop background reads on both legs (when there is no
-                      // decompressor, stream === proxyRes and the second
-                      // destroy() is a no-op).
-                      try {
-                        stream.destroy()
-                      } catch {
-                        // already destroyed
-                      }
-                      try {
-                        proxyRes.destroy()
-                      } catch {
-                        // already destroyed
-                      }
-                      if (!res.headersSent) {
-                        try {
-                          res.writeHead(502, { 'Content-Type': 'text/plain' })
-                        } catch {
-                          // headers raced to "sent"
-                        }
-                      }
-                      try {
-                        res.end(status502Body)
-                      } catch {
-                        // already ended
-                      }
-                    }
-                    // SECURITY: Bound decompressor output so a decompression-bomb
-                    // upstream cannot allocate gigabytes before our per-chunk
-                    // size check fires. Brotli supports a hard cap; for gzip/
-                    // deflate we rely on the per-chunk accumulator below.
-                    const stream: Readable =
-                      encoding === 'gzip' || encoding === 'x-gzip'
-                        ? proxyRes.pipe(createGunzip())
-                        : encoding === 'deflate'
-                          ? proxyRes.pipe(createInflate())
-                          : encoding === 'br'
-                            ? proxyRes.pipe(
-                                createBrotliDecompress({
-                                  maxOutputLength: MAX_HTML_REWRITE_BYTES,
-                                }),
-                              )
-                            : proxyRes
-                    // Attach error handlers BEFORE wiring `data`/`end` so that a
-                    // synchronous error on the source after `.pipe()` does not
-                    // become an unhandled 'error' event (process crash).
-                    proxyRes.on('error', () => abort('Bad Gateway: upstream error'))
-                    if (stream !== proxyRes) {
-                      stream.on('error', () => abort('Bad Gateway: decompression error'))
-                    }
-                    const chunks: Buffer[] = []
-                    let totalBytes = 0
-                    stream.on('data', (chunk: Buffer) => {
-                      if (aborted) return
-                      // Check the projected size BEFORE pushing so we cannot
-                      // briefly buffer 2× the cap with a single oversized chunk.
-                      if (totalBytes + chunk.length > MAX_HTML_REWRITE_BYTES) {
-                        abort('Bad Gateway: response too large to rewrite')
-                        return
-                      }
-                      totalBytes += chunk.length
-                      chunks.push(chunk)
-                    })
-                    stream.on('end', () => {
-                      if (aborted) return
-                      const html = Buffer.concat(chunks).toString('utf-8')
-                      // <head[\s/>] disambiguates from <header...> while
-                      // still matching <head>, <head class="...">, and the
-                      // self-closing <head/> form.
-                      const headRe = /<head(?=[\s/>])[^>]*>/i
-                      let injected: string
-                      if (headRe.test(html)) {
-                        injected = html.replace(headRe, (m) => m + rewriteScript)
-                      } else {
-                        // No <head> — fall back to injecting at the start of
-                        // <html> (for fragments) or at the document start.
-                        // This keeps the runtime XHR/fetch/WebSocket patches
-                        // active even when the upstream emits malformed HTML.
-                        const htmlRe = /<html\b[^>]*>/i
-                        injected = htmlRe.test(html)
-                          ? html.replace(htmlRe, (m) => m + rewriteScript)
-                          : rewriteScript + html
-                      }
-                      const rewritten = rewriteHtmlAttributes(
-                        injected,
-                        proxyPathPrefix,
-                        appConfig.path,
-                      )
-                      const buf = Buffer.from(rewritten, 'utf-8')
-                      const headers = { ...proxyRes.headers }
-                      delete headers['content-encoding'] // we decompressed
-                      delete headers['transfer-encoding']
-                      headers['content-length'] = String(buf.length)
-                      res.writeHead(status, headers)
-                      res.end(buf)
+                    rewriteHtmlResponse(proxyRes, res, {
+                      rewriteScript,
+                      proxyPathPrefix,
+                      appBasePath: appConfig.path,
+                      logError: (msg) => app.error(msg),
                     })
                     return
                   }
@@ -1030,6 +1337,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
         }
       })
 
+      wsUnavailable = false
       if (app.server && nextProxies.length > 0) {
         // Forward WebSocket upgrades to the correct per-app proxy.
         // ws:false above means http-proxy-middleware does NOT auto-intercept
@@ -1066,13 +1374,10 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
             reject404()
             return
           }
-          let afterAppId = slash >= 0 ? pathPart.substring(slash) : '/'
-          // Root escape: strip the /__root__ marker and dispatch via the host-only proxy.
-          const useRoot = afterAppId === ROOT_ESCAPE || afterAppId.startsWith(ROOT_ESCAPE + '/')
-          if (useRoot) {
-            afterAppId = afterAppId.slice(ROOT_ESCAPE.length) || '/'
-          }
-          const targetProxy = useRoot ? pair.root : pair.main
+          const afterAppId = slash >= 0 ? pathPart.substring(slash) : '/'
+          // Root escape: strip the /__root__ marker and dispatch via the
+          // host-only proxy. Shared with the HTTP route via resolveRootEscape.
+          const { path: targetPath, proxy: targetProxy } = resolveRootEscape(afterAppId, pair)
           if (!targetProxy) {
             reject404()
             return
@@ -1083,10 +1388,19 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
             return
           }
           stripInvalidHeaders(req)
-          req.url = afterAppId + queryString
+          req.url = targetPath + queryString
           proxyUpgrade.call(targetProxy, req, socket, head)
         }
         app.server.on('upgrade', upgradeHandler)
+      } else if (!app.server && nextProxies.some((p) => p != null)) {
+        // SignalK didn't expose the HTTP server, so upgrades can't be
+        // intercepted. HTTP proxying still works; warn so WebSocket-dependent
+        // apps (Portainer container exec, Node-RED) don't fail silently.
+        wsUnavailable = true
+        app.error(
+          'WebSocket support unavailable: SignalK did not expose app.server. ' +
+            'HTTP proxying works, but WebSocket upgrades will not be proxied.',
+        )
       }
 
       // Publish the new state only after the upgrade listener is wired so
@@ -1112,11 +1426,13 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
     registerWithRouter(router: IRouter): void {
       // List configured apps — consumed by the React UI on load.
       router.get('/apps', (_req: Request, res: Response): void => {
-        const list = currentApps.map((a, i) => ({
-          index: i,
-          name: a.name,
-          ...(a.appPath ? { appPath: a.appPath } : {}),
-        }))
+        // Skip null slots (apps that failed validation) but keep the surviving
+        // apps' positional index so numeric proxy URLs stay stable.
+        const list = currentApps.flatMap((a, i) =>
+          a == null
+            ? []
+            : [{ index: i, name: a.name, ...(a.appPath ? { appPath: a.appPath } : {}) }],
+        )
         res.json(list)
       })
 
@@ -1129,8 +1445,7 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
           // call type-checks once the signature widens — but TS still wants
           // an explicit narrowing because Request has extra methods.
           stripInvalidHeaders(req)
-          const rawAppId = req.params['appId']
-          const appId = typeof rawAppId === 'string' ? rawAppId : (rawAppId?.[0] ?? '')
+          const appId = firstHeaderValue(req.params['appId'])
           if (!started) {
             res.status(503).json({ error: 'Plugin is not started' })
             return
@@ -1144,12 +1459,8 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
           // After express has matched /proxy/:appId, req.url is the remaining
           // suffix (e.g. "/__root__/plugins/foo/ws" or "/api/bar"). Strip the
           // root escape and dispatch to the host-only proxy when present.
-          const u = req.url ?? ''
-          const useRoot = u === ROOT_ESCAPE || u.startsWith(ROOT_ESCAPE + '/')
-          if (useRoot) {
-            req.url = u.slice(ROOT_ESCAPE.length) || '/'
-          }
-          const proxy = useRoot ? pair.root : pair.main
+          const { path: targetPath, proxy } = resolveRootEscape(req.url ?? '', pair)
+          req.url = targetPath
           if (!proxy) {
             res.status(404).json({ error: `No app found for "${appId}"` })
             return
@@ -1228,11 +1539,37 @@ module.exports = function (app: ServerAPIWithServer): Plugin {
 
     statusMessage(): string {
       if (!started) return 'Not started'
-      if (currentApps.length === 0) return 'No apps configured'
-      const targets = currentApps.map((a) => buildTarget(a)).join(', ')
-      return `Proxying to: ${targets}`
+      // Ignore null slots (apps that failed validation).
+      const configured = currentApps.filter((a): a is AppConfig => a != null)
+      if (configured.length === 0) return 'No apps configured'
+      const targets = configured.map((a) => buildTarget(a)).join(', ')
+      const suffix = wsUnavailable ? ' (WebSocket support unavailable)' : ''
+      return `Proxying to: ${targets}${suffix}`
     },
   }
 
   return plugin
 }
+
+// Pure helpers exposed for direct unit testing. Attaching them to the exported
+// factory keeps the SignalK plugin contract (module.exports IS the factory
+// function called as require(...)(app)) intact, while letting tests import the
+// rewriting/parsing logic without booting a proxy.
+Object.assign(module.exports, {
+  parseAppConfig,
+  parseConfig,
+  resolveAppIndex,
+  computeProxiedSuffix,
+  isRootNamespace,
+  rewriteSetCookie,
+  splitCookieAttributes,
+  rewriteHtmlAttributes,
+  buildRewriteScript,
+  addCspNonce,
+  resolveRootEscape,
+  normalizeHost,
+  isValidHost,
+  buildTarget,
+  computeTargetOrigin,
+  jsLiteral,
+})

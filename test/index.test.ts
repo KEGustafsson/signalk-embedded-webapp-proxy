@@ -25,8 +25,30 @@ interface ServerAPIWithServer extends ServerAPI {
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const pluginFactory = require('../src/index') as (app: ServerAPIWithServer) => Plugin
 
+// Pure helpers attached to the factory for direct unit testing (see the
+// Object.assign at the bottom of src/index.ts).
+const H = pluginFactory as unknown as {
+  computeProxiedSuffix(url: string, base: string): string
+  resolveAppIndex(appId: string, apps: unknown[]): number
+  addCspNonce(csp: string, nonce: string): string
+  rewriteSetCookie(values: string[], prefix: string, base: string): string[]
+  rewriteHtmlAttributes(html: string, prefix: string, base: string): string
+  isRootNamespace(path: string): boolean
+  isValidHost(host: string): boolean
+  normalizeHost(host: string): string
+  splitCookieAttributes(cookie: string): string[]
+  resolveRootEscape(
+    path: string,
+    pair: { main: unknown; root?: unknown },
+  ): { path: string; proxy: unknown }
+  jsLiteral(s: string): string
+}
+
 const mockError = jest.fn()
-const mockApp = { error: mockError } as unknown as ServerAPIWithServer
+// A real SignalK server always exposes app.server; the shared mock mirrors that
+// (recreated each test in beforeEach so upgrade listeners don't accumulate).
+// The dedicated "no server" scenario builds its own app inline.
+let mockApp: ServerAPIWithServer
 
 /** Minimal valid config with one app entry */
 function oneApp(overrides: Record<string, unknown> = {}): object {
@@ -54,6 +76,10 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
 
   beforeEach(() => {
     jest.clearAllMocks()
+    mockApp = {
+      error: mockError,
+      server: new EventEmitter() as unknown as Server,
+    } as unknown as ServerAPIWithServer
     plugin = pluginFactory(mockApp)
   })
 
@@ -794,6 +820,95 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       ])
     })
 
+    it('keeps surviving apps at their original index when a middle app fails validation', () => {
+      // Regression for silent re-indexing: a bad app at index 1 must not shift
+      // the app configured at index 2 down to /proxy/1.
+      const proxy0: MockProxyMiddleware = jest.fn()
+      const proxy2: MockProxyMiddleware = jest.fn()
+      mockCreateProxyMiddleware.mockReturnValueOnce(proxy0).mockReturnValueOnce(proxy2)
+
+      plugin.start(
+        {
+          apps: [
+            { name: 'A', url: 'http://host-a:8080' },
+            { name: 'Bad', url: 'not a url' },
+            { name: 'C', url: 'http://host-c:3000' },
+          ],
+        },
+        jest.fn(),
+      )
+      plugin.registerWithRouter!(mockRouter)
+
+      // /apps skips the failed slot but C keeps index 2.
+      const appsHandler = registeredGetHandlers.get('/apps')!
+      const appsRes = { json: jest.fn() } as unknown as Response
+      appsHandler({} as Request, appsRes)
+      expect(appsRes.json).toHaveBeenCalledWith([
+        { index: 0, name: 'A' },
+        { index: 2, name: 'C' },
+      ])
+
+      const handler = registeredHandlers.get('/proxy/:appId')!
+      const next = jest.fn()
+
+      // /proxy/2 still reaches C (not shifted down to index 1).
+      handler({ params: { appId: '2' }, url: '/' } as unknown as Request, {} as Response, next)
+      expect(proxy2).toHaveBeenCalled()
+      expect(proxy0).not.toHaveBeenCalled()
+
+      // /proxy/1 is the failed slot → 404.
+      const res1 = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn().mockReturnThis(),
+      } as unknown as Response
+      handler({ params: { appId: '1' }, url: '/' } as unknown as Request, res1, next)
+      expect(res1.status).toHaveBeenCalledWith(404)
+
+      // The failed app was logged with its original config index.
+      expect(mockError).toHaveBeenCalledWith(expect.stringContaining('config index 1'))
+    })
+
+    it('keeps indices stable when a non-object config entry sits between valid apps', () => {
+      // A non-object slot (string/null/number) must become a null placeholder
+      // too, not be filtered out (which would collapse later indices).
+      const proxy0: MockProxyMiddleware = jest.fn()
+      const proxy2: MockProxyMiddleware = jest.fn()
+      mockCreateProxyMiddleware.mockReturnValueOnce(proxy0).mockReturnValueOnce(proxy2)
+
+      plugin.start(
+        {
+          apps: [
+            { name: 'A', url: 'http://host-a:8080' },
+            'not-an-object',
+            { name: 'C', url: 'http://host-c:3000' },
+          ],
+        },
+        jest.fn(),
+      )
+      plugin.registerWithRouter!(mockRouter)
+
+      const appsHandler = registeredGetHandlers.get('/apps')!
+      const appsRes = { json: jest.fn() } as unknown as Response
+      appsHandler({} as Request, appsRes)
+      expect(appsRes.json).toHaveBeenCalledWith([
+        { index: 0, name: 'A' },
+        { index: 2, name: 'C' },
+      ])
+
+      const handler = registeredHandlers.get('/proxy/:appId')!
+      const next = jest.fn()
+      handler({ params: { appId: '2' }, url: '/' } as unknown as Request, {} as Response, next)
+      expect(proxy2).toHaveBeenCalled()
+
+      const res1 = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn().mockReturnThis(),
+      } as unknown as Response
+      handler({ params: { appId: '1' }, url: '/' } as unknown as Request, res1, next)
+      expect(res1.status).toHaveBeenCalledWith(404)
+      expect(mockError).toHaveBeenCalledWith(expect.stringContaining('config index 1'))
+    })
+
     it('registers parameterized /proxy/:appId route', () => {
       plugin.registerWithRouter!(mockRouter)
       expect(mockRouter.use).toHaveBeenCalledWith('/proxy/:appId', expect.any(Function))
@@ -1418,11 +1533,16 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
     })
 
     it('does not invoke proxy upgrade when app.server is unavailable', () => {
-      // mockApp has no server property; no listener is registered so upgrade is never dispatched
-      const plugin = pluginFactory(mockApp)
+      // App without a server property: no listener is registered so upgrade is
+      // never dispatched, and the plugin warns that WS support is unavailable.
+      const noServerError = jest.fn()
+      const noServerApp = { error: noServerError } as unknown as ServerAPIWithServer
+      const plugin = pluginFactory(noServerApp)
       plugin.start(oneApp(), jest.fn())
 
       expect(dummyProxy.upgrade).not.toHaveBeenCalled()
+      expect(noServerError).toHaveBeenCalledWith(expect.stringContaining('WebSocket support'))
+      expect(plugin.statusMessage?.()).toContain('WebSocket support unavailable')
     })
 
     it('re-starting replaces the upgrade listener instead of leaking the previous one', () => {
@@ -1642,19 +1762,32 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
     interface MockRes {
       writeHead: jest.Mock
       end: jest.Mock
+      on: jest.Mock
+      destroy: jest.Mock
       headersSent: boolean
+      writableEnded: boolean
+      destroyed: boolean
     }
 
     async function runHtmlProxyRes(
       handler: ProxyResFn,
       html: string,
-      overrides: { contentType?: string; statusCode?: number } = {},
+      overrides: {
+        contentType?: string
+        statusCode?: number
+        contentEncoding?: string
+        body?: Buffer
+      } = {},
     ): Promise<{ body: Buffer; res: MockRes }> {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { PassThrough } = require('stream') as typeof import('stream')
       const proxyResStream = new PassThrough()
+      const headers: Record<string, string> = {
+        'content-type': overrides.contentType ?? 'text/html',
+      }
+      if (overrides.contentEncoding) headers['content-encoding'] = overrides.contentEncoding
       Object.assign(proxyResStream, {
-        headers: { 'content-type': overrides.contentType ?? 'text/html' },
+        headers,
         statusCode: overrides.statusCode ?? 200,
       })
 
@@ -1666,12 +1799,15 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const mockRes: MockRes = {
         writeHead: jest.fn(),
         end: jest.fn((buf: Buffer) => resolveEnd(buf)),
+        on: jest.fn(),
+        destroy: jest.fn(),
         headersSent: false,
+        writableEnded: false,
+        destroyed: false,
       }
 
       handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
-      proxyResStream.write(html)
-      proxyResStream.end()
+      proxyResStream.end(overrides.body ?? html)
 
       const body = await endPromise
       return { body, res: mockRes }
@@ -1765,8 +1901,10 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
 
       const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
 
-      expect(body.toString()).toContain(
-        '<script data-signalk-embedded-webapp-proxy="path-rewrite">',
+      // The injected tag carries a per-response nonce so it survives a strict
+      // upstream CSP (see addCspNonce).
+      expect(body.toString()).toMatch(
+        /<script nonce="[^"]+" data-signalk-embedded-webapp-proxy="path-rewrite">/,
       )
     })
 
@@ -1782,7 +1920,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
       const html = body.toString()
       const m = html.match(
-        /<script data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/,
+        /<script[^>]*data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/,
       )
       expect(m).not.toBeNull()
       const scriptBody = m![1]!
@@ -1799,7 +1937,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
       const html = body.toString()
       const scriptMatch = html.match(
-        /<script data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/,
+        /<script[^>]*data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/,
       )
       expect(scriptMatch).not.toBeNull()
       const scriptBody = scriptMatch![1]!
@@ -1864,7 +2002,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
       const scriptMatch = body
         .toString()
-        .match(/<script data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/)
+        .match(/<script[^>]*data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/)
       expect(scriptMatch).not.toBeNull()
       const scriptBody = scriptMatch![1]!
 
@@ -2390,7 +2528,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const out = body.toString()
       const headIdx = out.indexOf('<head>')
       const headerIdx = out.indexOf('<header')
-      const scriptIdx = out.indexOf('<script data-signalk-embedded-webapp-proxy=')
+      const scriptIdx = out.indexOf('data-signalk-embedded-webapp-proxy=')
       expect(scriptIdx).toBeGreaterThan(headIdx)
       expect(scriptIdx).toBeLessThan(headerIdx)
     })
@@ -2405,7 +2543,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       )
       const out = body.toString()
       // Falls back to injecting just after <html>.
-      expect(out).toContain('<script data-signalk-embedded-webapp-proxy="path-rewrite">')
+      expect(out).toContain('data-signalk-embedded-webapp-proxy="path-rewrite"')
       // Asset rewriting still applies.
       expect(out).toContain('src="/plugins/signalk-embedded-webapp-proxy/proxy/0/x.js"')
     })
@@ -2594,7 +2732,7 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       expect(cookies[0]).toContain('HttpOnly')
     })
 
-    it('strips Content-Security-Policy headers when rewritePaths is enabled', async () => {
+    it('nonce-patches Content-Security-Policy on HTML responses instead of deleting it', async () => {
       plugin.start(oneApp({ rewritePaths: true }), jest.fn())
       const handler = extractProxyResHandler()
 
@@ -2602,19 +2740,35 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const { PassThrough } = require('stream') as typeof import('stream')
       const proxyResStream = new PassThrough()
       const headers: Record<string, string> = {
-        'content-type': 'application/json',
+        'content-type': 'text/html',
         'content-security-policy': "default-src 'self'",
-        'content-security-policy-report-only': "default-src 'none'",
+        'content-security-policy-report-only': "script-src 'self'",
       }
       Object.assign(proxyResStream, { headers, statusCode: 200 })
       const { res, writeHead } = makeWritableRes()
+      const chunks: Buffer[] = []
+      res.on('data', (c: Buffer) => chunks.push(c))
       handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
-      proxyResStream.end()
+      proxyResStream.end('<html><head></head><body></body></html>')
       await new Promise((r) => res.on('finish', r))
 
-      const writeHeadCall = writeHead.mock.calls[0] as [number, Record<string, unknown>]
-      expect(writeHeadCall[1]).not.toHaveProperty('content-security-policy')
-      expect(writeHeadCall[1]).not.toHaveProperty('content-security-policy-report-only')
+      const sentHeaders = (writeHead.mock.calls[0] as [number, Record<string, string>])[1]
+      const csp = sentHeaders['content-security-policy']!
+      const cspRo = sentHeaders['content-security-policy-report-only']!
+      // CSP is preserved (not deleted) and carries a nonce that allows the
+      // injected inline script. default-src 'self' had no script-src, so an
+      // explicit script-src mirroring it + the nonce is added (rather than
+      // loosening default-src for every resource type).
+      const nonceMatch = /'nonce-([^']+)'/.exec(csp)
+      expect(nonceMatch).not.toBeNull()
+      expect(csp).toContain("script-src 'self' 'nonce-")
+      // report-only had an explicit script-src, so the nonce is appended to it.
+      expect(cspRo).toContain("script-src 'self' 'nonce-")
+      // The injected <script> tag uses the very same nonce as the CSP header.
+      const body = Buffer.concat(chunks).toString()
+      expect(body).toContain(
+        `<script nonce="${nonceMatch![1]!}" data-signalk-embedded-webapp-proxy="path-rewrite">`,
+      )
     })
 
     it('preserves Content-Security-Policy when rewritePaths is disabled', async () => {
@@ -2632,6 +2786,31 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const { res, writeHead } = makeWritableRes()
       handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
       proxyResStream.end()
+      await new Promise((r) => res.on('finish', r))
+
+      expect(writeHead).toHaveBeenCalledWith(
+        200,
+        expect.objectContaining({ 'content-security-policy': "default-src 'self'" }),
+      )
+    })
+
+    it('preserves Content-Security-Policy on non-HTML responses even with rewritePaths enabled', async () => {
+      // The injected script only lands in HTML, so a non-HTML response's CSP is
+      // left untouched (no nonce needed, nothing to allow).
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      const headers: Record<string, string> = {
+        'content-type': 'application/javascript',
+        'content-security-policy': "default-src 'self'",
+      }
+      Object.assign(proxyResStream, { headers, statusCode: 200 })
+      const { res, writeHead } = makeWritableRes()
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
+      proxyResStream.end('console.log(1)')
       await new Promise((r) => res.on('finish', r))
 
       expect(writeHead).toHaveBeenCalledWith(
@@ -2782,6 +2961,10 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
         writeHead: jest.fn(),
         end: jest.fn(() => resolveEnd()),
         headersSent: false,
+        writableEnded: false,
+        destroyed: false,
+        on: jest.fn(),
+        destroy: jest.fn(),
       }
 
       handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
@@ -2814,6 +2997,10 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
         writeHead: jest.fn(),
         end: jest.fn(() => resolveEnd()),
         headersSent: false,
+        writableEnded: false,
+        destroyed: false,
+        on: jest.fn(),
+        destroy: jest.fn(),
       }
 
       handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
@@ -2846,6 +3033,10 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
         writeHead: jest.fn(),
         end: jest.fn(() => resolveEnd()),
         headersSent: false,
+        writableEnded: false,
+        destroyed: false,
+        on: jest.fn(),
+        destroy: jest.fn(),
       }
 
       handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, mockRes)
@@ -2870,6 +3061,165 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const calls = mockProxyReq.setHeader.mock.calls as [string, string][]
       const headerMap = Object.fromEntries(calls.map(([k, v]) => [k, v]))
       expect(headerMap['X-Forwarded-Host']).toBe('sk.example.com:3000')
+    })
+
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const zlib = require('zlib') as typeof import('zlib')
+    const HTML_DOC = '<html><head></head><body><a href="/x"></a></body></html>'
+
+    it.each([
+      ['gzip', (b: string) => zlib.gzipSync(b)],
+      ['x-gzip', (b: string) => zlib.gzipSync(b)],
+      ['deflate', (b: string) => zlib.deflateSync(b)],
+      ['br', (b: string) => zlib.brotliCompressSync(b)],
+    ])(
+      'decodes %s HTML, injects the script, and strips content-encoding',
+      async (enc, compress) => {
+        plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+        const handler = extractProxyResHandler()
+
+        const { body, res } = await runHtmlProxyRes(handler, '', {
+          contentEncoding: enc,
+          body: compress(HTML_DOC),
+        })
+
+        const out = body.toString()
+        expect(out).toContain('data-signalk-embedded-webapp-proxy="path-rewrite"')
+        expect(out).toContain('href="/plugins/signalk-embedded-webapp-proxy/proxy/0/x"')
+        const sent = (res.writeHead.mock.calls[0] as [number, Record<string, string>])[1]
+        expect(sent['content-encoding']).toBeUndefined()
+        expect(sent['content-length']).toBe(String(body.length))
+      },
+    )
+
+    it('returns 502 when a brotli body decompresses beyond the size cap', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // 11 MiB decompressed exceeds MAX_HTML_REWRITE_BYTES (10 MiB); the brotli
+      // maxOutputLength cap makes the decompressor error before buffering it all.
+      const big = '<html><head></head>' + 'A'.repeat(11 * 1024 * 1024)
+      const { res } = await runHtmlProxyRes(handler, '', {
+        contentEncoding: 'br',
+        body: zlib.brotliCompressSync(big),
+      })
+
+      expect(res.writeHead).toHaveBeenCalledWith(502, { 'Content-Type': 'text/plain' })
+    })
+
+    it('streams through (does not rewrite) HTML declared as a non-UTF-8 charset', async () => {
+      plugin.start(oneApp({ rewritePaths: true }), jest.fn())
+      const handler = extractProxyResHandler()
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PassThrough } = require('stream') as typeof import('stream')
+      const proxyResStream = new PassThrough()
+      Object.assign(proxyResStream, {
+        headers: { 'content-type': 'text/html; charset=iso-8859-1' },
+        statusCode: 200,
+      })
+      const res = new PassThrough() as import('stream').PassThrough & {
+        writeHead: jest.Mock
+        headersSent: boolean
+      }
+      res.writeHead = jest.fn()
+      res.headersSent = false
+      const chunks: Buffer[] = []
+      res.on('data', (c: Buffer) => chunks.push(c))
+
+      const original = '<html><head></head><body>x</body></html>'
+      handler(proxyResStream as unknown as IncomingMessage, {} as IncomingMessage, res)
+      proxyResStream.end(original)
+      await new Promise((r) => res.on('finish', r))
+
+      expect(Buffer.concat(chunks).toString()).toBe(original)
+      expect(mockError).toHaveBeenCalledWith(expect.stringContaining('non-UTF-8 charset'))
+    })
+
+    // Behavior tests for the injected client script: execute it in a real-ish
+    // VM context and assert it actually rewrites fetch/XHR/history/location,
+    // not just that the source string mentions them.
+    function runInjectedScript(sandbox: Record<string, unknown>, scriptBody: string): void {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const vm = require('vm') as typeof import('vm')
+      vm.createContext(sandbox)
+      vm.runInContext(scriptBody, sandbox)
+    }
+
+    async function getScriptBody(appOverrides: Record<string, unknown> = {}): Promise<string> {
+      plugin.start(oneApp({ rewritePaths: true, ...appOverrides }), jest.fn())
+      const handler = extractProxyResHandler()
+      const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
+      const m = body
+        .toString()
+        .match(/<script[^>]*data-signalk-embedded-webapp-proxy="path-rewrite">([\s\S]*?)<\/script>/)
+      return m![1]!
+    }
+
+    it('client script rewrites XMLHttpRequest.open URLs through the proxy', async () => {
+      const scriptBody = await getScriptBody()
+      const opened: string[] = []
+      const sandbox = {
+        window: {
+          fetch: () => {},
+          WebSocket: null,
+          history: null,
+          MutationObserver: null,
+          location: { protocol: 'http:', host: 'h:3000', assign() {}, replace() {} },
+        } as Record<string, unknown>,
+        XMLHttpRequest: {
+          prototype: {
+            open(_method: string, url: string) {
+              opened.push(url)
+            },
+          },
+        },
+        Location: { prototype: {} },
+        Object,
+      }
+      runInjectedScript(sandbox, scriptBody)
+      const xhr = sandbox.XMLHttpRequest.prototype as { open: (m: string, u: string) => void }
+      xhr.open('GET', '/api/auth')
+      expect(opened[0]).toBe('/plugins/signalk-embedded-webapp-proxy/proxy/0/api/auth')
+    })
+
+    it('client script rewrites history.pushState and location.assign URLs', async () => {
+      const scriptBody = await getScriptBody()
+      const pushed: string[] = []
+      const assigned: string[] = []
+      const sandbox = {
+        window: {
+          fetch: () => {},
+          WebSocket: null,
+          MutationObserver: null,
+          history: {
+            pushState(_s: unknown, _t: string, u: string) {
+              pushed.push(u)
+            },
+            replaceState() {},
+          },
+          location: {
+            protocol: 'http:',
+            host: 'h:3000',
+            assign(u: string) {
+              assigned.push(u)
+            },
+            replace() {},
+          },
+        } as Record<string, unknown>,
+        XMLHttpRequest: { prototype: { open() {} } },
+        Location: { prototype: {} },
+        Object,
+      }
+      runInjectedScript(sandbox, scriptBody)
+      const win = sandbox.window as {
+        history: { pushState: (s: unknown, t: string, u: string) => void }
+        location: { assign: (u: string) => void }
+      }
+      win.history.pushState({}, '', '/dashboard')
+      win.location.assign('/login')
+      expect(pushed[0]).toBe('/plugins/signalk-embedded-webapp-proxy/proxy/0/dashboard')
+      expect(assigned[0]).toBe('/plugins/signalk-embedded-webapp-proxy/proxy/0/login')
     })
   })
 
@@ -2936,6 +3286,205 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const mockRes = { json: jest.fn() } as unknown as Response
       h({} as Request, mockRes)
       expect(mockRes.json).toHaveBeenCalledWith([{ index: 0, name: 'P', appPath: 'portainer' }])
+    })
+  })
+})
+
+describe('pure helpers (direct unit tests)', () => {
+  const PREFIX = '/plugins/signalk-embedded-webapp-proxy/proxy/0'
+
+  describe('computeProxiedSuffix', () => {
+    it('returns the URL unchanged when the app base is root', () => {
+      expect(H.computeProxiedSuffix('/api/x', '/')).toBe('/api/x')
+      // Root-namespace paths are NOT escaped for a root-base app (no root proxy
+      // exists), so /__root__ must never appear.
+      expect(H.computeProxiedSuffix('/signalk/x', '/')).toBe('/signalk/x')
+    })
+
+    it('strips the app base path when the URL is inside it', () => {
+      expect(H.computeProxiedSuffix('/grafana/d/board', '/grafana')).toBe('/d/board')
+    })
+
+    it('maps a URL equal to the base path to "/" (regression: missing trailing slash)', () => {
+      expect(H.computeProxiedSuffix('/grafana', '/grafana')).toBe('/')
+    })
+
+    it('root-escapes SignalK namespaces that fall outside a non-root base', () => {
+      expect(H.computeProxiedSuffix('/signalk/v1', '/grafana')).toBe('/__root__/signalk/v1')
+      expect(H.computeProxiedSuffix('/plugins/foo/ws', '/grafana')).toBe('/__root__/plugins/foo/ws')
+    })
+
+    it('passes non-namespace out-of-base URLs through unchanged', () => {
+      expect(H.computeProxiedSuffix('/api/frontend', '/grafana')).toBe('/api/frontend')
+    })
+  })
+
+  describe('resolveAppIndex', () => {
+    const apps = [{ appPath: 'portainer' }, null, { appPath: '' }] as unknown[]
+
+    it('resolves an in-range numeric index to itself', () => {
+      expect(H.resolveAppIndex('0', apps)).toBe(0)
+      expect(H.resolveAppIndex('2', apps)).toBe(2)
+    })
+
+    it('returns -1 for an out-of-range numeric index (internal bounds check)', () => {
+      expect(H.resolveAppIndex('3', apps)).toBe(-1)
+      expect(H.resolveAppIndex('999', apps)).toBe(-1)
+    })
+
+    it('returns -1 for a null placeholder slot', () => {
+      expect(H.resolveAppIndex('1', apps)).toBe(-1)
+    })
+
+    it('rejects non-canonical numeric forms', () => {
+      expect(H.resolveAppIndex('00', apps)).toBe(-1)
+      expect(H.resolveAppIndex('01', apps)).toBe(-1)
+    })
+
+    it('resolves appPath case-insensitively and skips null slots', () => {
+      expect(H.resolveAppIndex('Portainer', apps)).toBe(0)
+      expect(H.resolveAppIndex('nope', apps)).toBe(-1)
+    })
+  })
+
+  describe('addCspNonce', () => {
+    const N = 'abc123=='
+
+    it('appends the nonce to an existing strict script-src', () => {
+      expect(H.addCspNonce("script-src 'self'", N)).toBe(`script-src 'self' 'nonce-${N}'`)
+    })
+
+    it('adds a script-src mirroring default-src when script-src is absent', () => {
+      expect(H.addCspNonce("default-src 'self'", N)).toBe(
+        `default-src 'self'; script-src 'self' 'nonce-${N}'`,
+      )
+    })
+
+    it("leaves an 'unsafe-inline' script-src untouched (adding a nonce would disable it)", () => {
+      const csp = "script-src 'self' 'unsafe-inline'"
+      expect(H.addCspNonce(csp, N)).toBe(csp)
+    })
+
+    it("still adds a nonce when 'unsafe-inline' coexists with a nonce/strict-dynamic", () => {
+      expect(H.addCspNonce("script-src 'unsafe-inline' 'strict-dynamic'", N)).toContain(
+        `'nonce-${N}'`,
+      )
+    })
+
+    it('does nothing when neither script-src nor default-src is present', () => {
+      expect(H.addCspNonce("img-src 'self'", N)).toBe("img-src 'self'")
+    })
+
+    it('targets script-src-elem as well', () => {
+      expect(H.addCspNonce("script-src-elem 'self'", N)).toBe(`script-src-elem 'self' 'nonce-${N}'`)
+    })
+
+    it('patches both script-src and script-src-elem regardless of directive order', () => {
+      // script-src-elem governs inline <script> elements when present, so both
+      // must carry the nonce — patching only the last-seen one would block the
+      // injected script depending on header order.
+      expect(H.addCspNonce("script-src 'self'; script-src-elem 'self'", N)).toBe(
+        `script-src 'self' 'nonce-${N}'; script-src-elem 'self' 'nonce-${N}'`,
+      )
+      expect(H.addCspNonce("script-src-elem 'self'; script-src 'self'", N)).toBe(
+        `script-src-elem 'self' 'nonce-${N}'; script-src 'self' 'nonce-${N}'`,
+      )
+    })
+
+    it('does not fall back to default-src when a script directive is present', () => {
+      // script-src-elem present → governs scripts; default-src is left alone and
+      // no extra script-src is appended.
+      expect(H.addCspNonce("default-src 'self'; script-src-elem 'self'", N)).toBe(
+        `default-src 'self'; script-src-elem 'self' 'nonce-${N}'`,
+      )
+    })
+  })
+
+  describe('rewriteSetCookie', () => {
+    it('keeps Path=/ for __Host- prefixed cookies so the browser does not reject them', () => {
+      const out = H.rewriteSetCookie(['__Host-sess=x; Path=/; Secure; HttpOnly'], PREFIX, '/')
+      expect(out[0]).toContain('Path=/')
+      expect(out[0]).not.toContain(`Path=${PREFIX}`)
+      expect(out[0]).toContain('Secure')
+      expect(out[0]).toContain('HttpOnly')
+    })
+
+    it('still rewrites Path for ordinary cookies', () => {
+      const out = H.rewriteSetCookie(['sess=x; Path=/', '__Secure-a=b; Path=/api'], PREFIX, '/')
+      expect(out[0]).toContain(`Path=${PREFIX}/`)
+      // __Secure- has no Path constraint, so it is rewritten like any cookie.
+      expect(out[1]).toContain(`Path=${PREFIX}/api`)
+    })
+
+    it('leaves a non-root-relative Path value untouched', () => {
+      const out = H.rewriteSetCookie(['sess=x; Path=relativepath'], PREFIX, '/')
+      expect(out[0]).toContain('Path=relativepath')
+    })
+  })
+
+  describe('rewriteHtmlAttributes', () => {
+    it('rewrites unquoted absolute-path attribute values', () => {
+      const out = H.rewriteHtmlAttributes('<a href=/login>x</a>', PREFIX, '/')
+      expect(out).toBe(`<a href=${PREFIX}/login>x</a>`)
+    })
+
+    it('rewrites each absolute URL inside srcset, preserving descriptors', () => {
+      const out = H.rewriteHtmlAttributes('<img srcset="/a.png 1x, /b.png 2x">', PREFIX, '/')
+      expect(out).toContain(`${PREFIX}/a.png 1x`)
+      expect(out).toContain(`${PREFIX}/b.png 2x`)
+    })
+
+    it('rewrites <base href> via the href attribute rule', () => {
+      const out = H.rewriteHtmlAttributes('<base href="/grafana/">', PREFIX, '/grafana')
+      expect(out).toBe(`<base href="${PREFIX}/">`)
+    })
+
+    it('preserves protocol-relative and already-proxied values', () => {
+      const out = H.rewriteHtmlAttributes(
+        `<img src="//cdn/x.png"><img src="${PREFIX}/y.png">`,
+        PREFIX,
+        '/',
+      )
+      expect(out).toBe(`<img src="//cdn/x.png"><img src="${PREFIX}/y.png">`)
+    })
+  })
+
+  describe('resolveRootEscape', () => {
+    const pair = { main: 'MAIN', root: 'ROOT' }
+
+    it('strips the marker and selects the root proxy for an escaped path', () => {
+      expect(H.resolveRootEscape('/__root__/signalk/x', pair)).toEqual({
+        path: '/signalk/x',
+        proxy: 'ROOT',
+      })
+    })
+
+    it('maps a bare /__root__ to "/"', () => {
+      expect(H.resolveRootEscape('/__root__', pair)).toEqual({ path: '/', proxy: 'ROOT' })
+    })
+
+    it('selects the main proxy for a normal path', () => {
+      expect(H.resolveRootEscape('/api/x', pair)).toEqual({ path: '/api/x', proxy: 'MAIN' })
+    })
+
+    it('returns an undefined proxy when a root escape is requested but no root proxy exists', () => {
+      expect(H.resolveRootEscape('/__root__/x', { main: 'MAIN' })).toEqual({
+        path: '/x',
+        proxy: undefined,
+      })
+    })
+  })
+
+  describe('isValidHost / normalizeHost', () => {
+    it('blocks cloud-metadata hosts and their variants', () => {
+      expect(H.isValidHost('169.254.169.254')).toBe(false)
+      expect(H.isValidHost('METADATA.GOOGLE.INTERNAL')).toBe(false)
+      expect(H.isValidHost('metadata.google.internal.')).toBe(false)
+    })
+
+    it('allows ordinary internal hosts', () => {
+      expect(H.isValidHost('127.0.0.1')).toBe(true)
+      expect(H.isValidHost('192.168.1.10')).toBe(true)
     })
   })
 })
