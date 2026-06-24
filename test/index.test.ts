@@ -33,6 +33,7 @@ const H = pluginFactory as unknown as {
   addCspNonce(csp: string, nonce: string): string
   rewriteSetCookie(values: string[], prefix: string, base: string): string[]
   rewriteHtmlAttributes(html: string, prefix: string, base: string): string
+  rewriteEmbeddedBasePath(html: string, prefix: string, base: string): string
   isRootNamespace(path: string): boolean
   isValidHost(host: string): boolean
   normalizeHost(host: string): string
@@ -2359,8 +2360,10 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const { body } = await runHtmlProxyRes(handler, '<html><head></head><body></body></html>')
 
       const scriptContent = body.toString()
-      expect(scriptContent).toContain('L.assign')
-      expect(scriptContent).toContain('L.replace')
+      // Must patch on Location.prototype, not the window.location instance —
+      // instance properties are non-writable in real browsers (see src comment).
+      expect(scriptContent).toContain('LpN.assign')
+      expect(scriptContent).toContain('LpN.replace')
     })
 
     it('does not double-prefix attributes when app url has a base path', async () => {
@@ -3187,6 +3190,22 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
       const scriptBody = await getScriptBody()
       const pushed: string[] = []
       const assigned: string[] = []
+      const replaced: string[] = []
+      // Mirror a real browser: assign/replace live on Location.prototype and
+      // the window.location instance inherits them. The injected script patches
+      // the prototype (the instance's own properties are non-writable in
+      // browsers), so the instance must delegate to the prototype here.
+      const locationProto = {
+        assign(u: string) {
+          assigned.push(u)
+        },
+        replace(u: string) {
+          replaced.push(u)
+        },
+      }
+      const locationInstance = Object.create(locationProto) as Record<string, unknown>
+      locationInstance['protocol'] = 'http:'
+      locationInstance['host'] = 'h:3000'
       const sandbox = {
         window: {
           fetch: () => {},
@@ -3198,28 +3217,23 @@ describe('signalk-embedded-webapp-proxy plugin', () => {
             },
             replaceState() {},
           },
-          location: {
-            protocol: 'http:',
-            host: 'h:3000',
-            assign(u: string) {
-              assigned.push(u)
-            },
-            replace() {},
-          },
+          location: locationInstance,
         } as Record<string, unknown>,
         XMLHttpRequest: { prototype: { open() {} } },
-        Location: { prototype: {} },
+        Location: { prototype: locationProto },
         Object,
       }
       runInjectedScript(sandbox, scriptBody)
       const win = sandbox.window as {
         history: { pushState: (s: unknown, t: string, u: string) => void }
-        location: { assign: (u: string) => void }
+        location: { assign: (u: string) => void; replace: (u: string) => void }
       }
       win.history.pushState({}, '', '/dashboard')
       win.location.assign('/login')
+      win.location.replace('/logout')
       expect(pushed[0]).toBe('/plugins/signalk-embedded-webapp-proxy/proxy/0/dashboard')
       expect(assigned[0]).toBe('/plugins/signalk-embedded-webapp-proxy/proxy/0/login')
+      expect(replaced[0]).toBe('/plugins/signalk-embedded-webapp-proxy/proxy/0/logout')
     })
   })
 
@@ -3446,6 +3460,35 @@ describe('pure helpers (direct unit tests)', () => {
         '/',
       )
       expect(out).toBe(`<img src="//cdn/x.png"><img src="${PREFIX}/y.png">`)
+    })
+  })
+
+  describe('rewriteEmbeddedBasePath', () => {
+    it("rewrites Grafana's appSubUrl to the proxy prefix so hard navigations stay proxied", () => {
+      // Grafana does `location.href = appSubUrl + "/"` after login; location is
+      // [LegacyUnforgeable] so this must be fixed in the body, not by the script.
+      const out = H.rewriteEmbeddedBasePath(
+        '<script>window.grafanaBootData={settings:{"appSubUrl":"/grafana","x":1}}</script>',
+        PREFIX,
+        '/grafana/',
+      )
+      expect(out).toContain(`"appSubUrl":"${PREFIX}"`)
+      expect(out).not.toContain('"appSubUrl":"/grafana"')
+    })
+
+    it('handles whitespace around the colon', () => {
+      const out = H.rewriteEmbeddedBasePath('{"appSubUrl" : "/grafana"}', PREFIX, '/grafana')
+      expect(out).toBe(`{"appSubUrl" : "${PREFIX}"}`)
+    })
+
+    it('rewrites an empty appSubUrl (app served at root) to the proxy prefix', () => {
+      const out = H.rewriteEmbeddedBasePath('{"appSubUrl":""}', PREFIX, '/')
+      expect(out).toBe(`{"appSubUrl":"${PREFIX}"}`)
+    })
+
+    it('leaves bodies without the token untouched', () => {
+      const html = '<html><body>no bootstrap here /grafana stays</body></html>'
+      expect(H.rewriteEmbeddedBasePath(html, PREFIX, '/grafana')).toBe(html)
     })
   })
 
